@@ -53,11 +53,155 @@ function extractHealthAnalysis(result) {
 }
 
 function getPlantsKey(email) { return `ecoscan_plants_${email.toLowerCase().trim()}`; }
-function loadPlants(email) {
-  try { const r = localStorage.getItem(getPlantsKey(email)); return r ? JSON.parse(r) : []; }
-  catch { return []; }
+
+async function fetchPlantsFromSupabase(userId, emailFallback) {
+  try {
+    const { data, error } = await supabase
+      .from('plants')
+      .select('*')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
+    
+    if (error) throw error;
+    
+    return data.map(dbPlant => ({
+      id: dbPlant.id,
+      name: dbPlant.name,
+      species: dbPlant.species,
+      thumbnail: dbPlant.thumbnail,
+      mainImage: dbPlant.main_image,
+      registeredAt: dbPlant.registered_at,
+      lastPhotoDate: dbPlant.last_photo_date,
+      lastWatered: dbPlant.last_watered,
+      lastFertilized: dbPlant.last_fertilized,
+      waterStreak: dbPlant.water_streak || 0,
+      confidence: dbPlant.confidence,
+      recommendedWateringDays: dbPlant.recommended_watering_days,
+      recommendedFertilizerDays: dbPlant.recommended_fertilizer_days,
+      fertilizerType: dbPlant.fertilizer_type,
+      sunlight: dbPlant.sunlight,
+      difficulty: dbPlant.difficulty,
+      activities: dbPlant.activities || [],
+      updates: dbPlant.updates || [],
+      chatHistory: dbPlant.chat_history || [],
+      notes: dbPlant.notes || ''
+    }));
+  } catch (err) {
+    console.error('Error fetching plants from Supabase, falling back to LocalStorage:', err);
+    try {
+      const r = localStorage.getItem(getPlantsKey(emailFallback));
+      return r ? JSON.parse(r) : [];
+    } catch {
+      return [];
+    }
+  }
 }
-function savePlants(email, plants) { localStorage.setItem(getPlantsKey(email), JSON.stringify(plants)); }
+
+async function dbInsertPlant(userId, plant, emailFallback) {
+  try {
+    const dbPlant = {
+      id: plant.id,
+      user_id: userId,
+      name: plant.name,
+      species: plant.species,
+      thumbnail: plant.thumbnail,
+      main_image: plant.mainImage,
+      registered_at: plant.registeredAt,
+      last_photo_date: plant.lastPhotoDate,
+      last_watered: plant.lastWatered,
+      last_fertilized: plant.lastFertilized,
+      water_streak: plant.waterStreak || 0,
+      confidence: plant.confidence,
+      recommended_watering_days: plant.recommendedWateringDays,
+      recommended_fertilizer_days: plant.recommendedFertilizerDays,
+      fertilizer_type: plant.fertilizerType,
+      sunlight: plant.sunlight,
+      difficulty: plant.difficulty,
+      activities: plant.activities || [],
+      updates: plant.updates || [],
+      chat_history: plant.chatHistory || [],
+      notes: plant.notes || ''
+    };
+    const { error } = await supabase.from('plants').insert(dbPlant);
+    if (error) throw error;
+  } catch (err) {
+    console.error('Error inserting plant into Supabase:', err);
+  }
+  // LocalStorage fallback cache update
+  try {
+    const key = getPlantsKey(emailFallback);
+    const local = localStorage.getItem(key);
+    const list = local ? JSON.parse(local) : [];
+    localStorage.setItem(key, JSON.stringify([plant, ...list.filter(p => p.id !== plant.id)]));
+  } catch {}
+}
+
+async function dbUpdatePlant(userId, plant, emailFallback) {
+  try {
+    const dbPlant = {
+      name: plant.name,
+      species: plant.species,
+      thumbnail: plant.thumbnail,
+      main_image: plant.mainImage,
+      registered_at: plant.registeredAt,
+      last_photo_date: plant.lastPhotoDate,
+      last_watered: plant.lastWatered,
+      last_fertilized: plant.lastFertilized,
+      water_streak: plant.waterStreak || 0,
+      confidence: plant.confidence,
+      recommended_watering_days: plant.recommendedWateringDays,
+      recommended_fertilizer_days: plant.recommendedFertilizerDays,
+      fertilizer_type: plant.fertilizerType,
+      sunlight: plant.sunlight,
+      difficulty: plant.difficulty,
+      activities: plant.activities || [],
+      updates: plant.updates || [],
+      chat_history: plant.chatHistory || [],
+      notes: plant.notes || ''
+    };
+    const { error } = await supabase
+      .from('plants')
+      .update(dbPlant)
+      .eq('id', plant.id)
+      .eq('user_id', userId);
+    if (error) throw error;
+  } catch (err) {
+    console.error('Error updating plant in Supabase:', err);
+  }
+  // LocalStorage fallback cache update
+  try {
+    const key = getPlantsKey(emailFallback);
+    const local = localStorage.getItem(key);
+    if (local) {
+      const list = JSON.parse(local);
+      const updatedList = list.map(p => p.id === plant.id ? plant : p);
+      localStorage.setItem(key, JSON.stringify(updatedList));
+    }
+  } catch {}
+}
+
+async function dbDeletePlant(userId, plantId, emailFallback) {
+  try {
+    const { error } = await supabase
+      .from('plants')
+      .delete()
+      .eq('id', plantId)
+      .eq('user_id', userId);
+    if (error) throw error;
+  } catch (err) {
+    console.error('Error deleting plant from Supabase:', err);
+  }
+  // LocalStorage fallback cache update
+  try {
+    const key = getPlantsKey(emailFallback);
+    const local = localStorage.getItem(key);
+    if (local) {
+      const list = JSON.parse(local);
+      const updatedList = list.filter(p => p.id !== plantId);
+      localStorage.setItem(key, JSON.stringify(updatedList));
+    }
+  } catch {}
+}
 
 // ─── PLAN HELPERS ─────────────────────────────────────────────────────────────
 
@@ -1620,7 +1764,8 @@ export default function Home() {
       if (session?.user) {
         const u = { email: session.user.email, name: session.user.user_metadata?.name || session.user.email, id: session.user.id };
         setUser(u);
-        setPlants(loadPlants(u.email));
+        const list = await fetchPlantsFromSupabase(u.id, u.email);
+        setPlants(list);
         setUserPlan(loadUserPlan(u.email)); // FIX #4
       }
       setReady(true);
@@ -1630,7 +1775,8 @@ export default function Home() {
       if (session?.user) {
         const u = { email: session.user.email, name: session.user.user_metadata?.name || session.user.email, id: session.user.id };
         setUser(u);
-        setPlants(loadPlants(u.email));
+        const list = await fetchPlantsFromSupabase(u.id, u.email);
+        setPlants(list);
         setUserPlan(loadUserPlan(u.email)); // FIX #4
       } else {
         setUser(null); setPlants([]); setUserPlan('free');
@@ -1687,31 +1833,37 @@ export default function Home() {
     setShowAddPlant(true);
   };
 
-  const savePlant = (newPlant) => {
+  const savePlant = async (newPlant) => {
     const updated = [newPlant, ...plants];
     setPlants(updated);
-    if (user) savePlants(user.email, updated);
+    if (user) {
+      await dbInsertPlant(user.id, newPlant, user.email);
+    }
     setShowAddPlant(false);
     setView(VIEWS.MY_PLANTS);
   };
 
-  const updatePlant = useCallback((updatedPlant) => {
+  const updatePlant = useCallback(async (updatedPlant) => {
     setPlants(prev => {
       const updated = prev.map(p => p.id === updatedPlant.id ? updatedPlant : p);
-      if (user) savePlants(user.email, updated);
       return updated;
     });
+    if (user) {
+      await dbUpdatePlant(user.id, updatedPlant, user.email);
+    }
     // FIX #6: keep selectedPlant in sync
     setSelectedPlant(updatedPlant);
   }, [user]);
 
   // FIX #2: Delete plant handler
-  const deletePlant = useCallback((plantId) => {
+  const deletePlant = useCallback(async (plantId) => {
     setPlants(prev => {
       const updated = prev.filter(p => p.id !== plantId);
-      if (user) savePlants(user.email, updated);
       return updated;
     });
+    if (user) {
+      await dbDeletePlant(user.id, plantId, user.email);
+    }
     setSelectedPlant(null);
     setView(VIEWS.MY_PLANTS);
   }, [user]);
