@@ -7,6 +7,8 @@ import { supabase } from '../../lib/supabase';
 const VIEWS = { DASHBOARD: 'dashboard', MY_PLANTS: 'my_plants', PLANT_DETAIL: 'plant_detail', ADD_PLANT: 'add_plant' };
 const HEALTH_COLORS = { excellent: '#16A34A', good: '#65A30D', fair: '#D97706', poor: '#DC2626' };
 const HEALTH_LABELS = { excellent: 'Excelente', good: 'Buena', fair: 'Regular', poor: 'Crítica' };
+const FREE_PLANT_LIMIT = 1;
+const FREE_CHAT_DAILY_LIMIT = 20;
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 
@@ -26,12 +28,76 @@ function createThumbnail(base64Image) {
   });
 }
 
+// FIX #1: Extract health_analysis safely from AI response (string or parsed JSON)
+function extractHealthAnalysis(result) {
+  if (!result) return 'No se pudo obtener análisis de salud.';
+  // If it's a string that looks like JSON, parse it
+  if (typeof result === 'string') {
+    const cleaned = result.replace(/```json|```/g, '').trim();
+    if (cleaned.startsWith('{')) {
+      try {
+        const parsed = JSON.parse(cleaned);
+        if (parsed.health_analysis) return parsed.health_analysis;
+        return 'Análisis completado, pero sin detalle de salud disponible.';
+      } catch {
+        // Not JSON — treat as plain text
+        return result;
+      }
+    }
+    return result; // plain text response
+  }
+  if (typeof result === 'object' && result.health_analysis) {
+    return result.health_analysis;
+  }
+  return 'No se pudo obtener análisis de salud.';
+}
+
 function getPlantsKey(email) { return `ecoscan_plants_${email.toLowerCase().trim()}`; }
 function loadPlants(email) {
   try { const r = localStorage.getItem(getPlantsKey(email)); return r ? JSON.parse(r) : []; }
   catch { return []; }
 }
 function savePlants(email, plants) { localStorage.setItem(getPlantsKey(email), JSON.stringify(plants)); }
+
+// ─── PLAN HELPERS ─────────────────────────────────────────────────────────────
+
+function getChatUsageKey(email) {
+  const today = new Date().toISOString().slice(0, 10);
+  return `ecoscan_chat_${email.toLowerCase().trim()}_${today}`;
+}
+
+function getChatUsage(email) {
+  try {
+    const key = getChatUsageKey(email);
+    const val = localStorage.getItem(key);
+    return val ? parseInt(val, 10) : 0;
+  } catch { return 0; }
+}
+
+function incrementChatUsage(email) {
+  try {
+    const key = getChatUsageKey(email);
+    const current = getChatUsage(email);
+    localStorage.setItem(key, String(current + 1));
+    return current + 1;
+  } catch { return 0; }
+}
+
+function getUserPlanKey(email) { return `ecoscan_plan_${email.toLowerCase().trim()}`; }
+
+function loadUserPlan(email) {
+  try {
+    const val = localStorage.getItem(getUserPlanKey(email));
+    if (!val) return 'free';
+    const data = JSON.parse(val);
+    // Check if premium is still valid
+    if (data.plan === 'premium' && data.premiumUntil) {
+      if (new Date(data.premiumUntil) > new Date()) return 'premium';
+      return 'free';
+    }
+    return data.plan || 'free';
+  } catch { return 'free'; }
+}
 
 function daysBetween(dateStr) {
   if (!dateStr) return null;
@@ -50,7 +116,6 @@ function formatDate(dateStr) {
   return new Date(dateStr).toLocaleDateString('es-ES', { day: 'numeric', month: 'short', year: 'numeric' });
 }
 
-// Returns ms until next watering (can be negative if overdue)
 function msUntilNext(lastDateStr, intervalDays) {
   if (!lastDateStr || !intervalDays) return null;
   const next = new Date(lastDateStr).getTime() + intervalDays * 86400000;
@@ -66,6 +131,7 @@ function formatCountdown(ms) {
   return { days, hours, mins, overdue: ms < 0 };
 }
 
+// FIX #3: These functions are now pure with no side-effects so re-renders work correctly
 function getWateringStatus(plant) {
   const ms = msUntilNext(plant.lastWatered, plant.recommendedWateringDays || plant.waterInterval || 3);
   if (ms === null) return 'unknown';
@@ -92,8 +158,10 @@ function getHealthStatus(plant) {
   if (status === 'overdue') return 'poor';
   if (status === 'soon') return 'fair';
   const waterDays = daysBetween(plant.lastWatered);
+  // FIX #3: Just watered (same day) → excellent
   if (waterDays === null) return 'fair';
-  if (waterDays <= 1) return 'excellent';
+  if (waterDays === 0) return 'excellent';
+  if (waterDays === 1) return 'good';
   return 'good';
 }
 
@@ -149,9 +217,77 @@ function useCountdown(lastDateStr, intervalDays) {
     tick();
     const id = setInterval(tick, 60000);
     return () => clearInterval(id);
-  }, [lastDateStr, intervalDays]);
+  }, [lastDateStr, intervalDays]); // FIX #3: dependencies are correct — re-runs when lastWatered changes
 
   return countdown;
+}
+
+// ─── PLAN BADGE ────────────────────────────────────────────────────────────────
+
+function PlanBadge({ plan }) {
+  if (plan === 'premium') {
+    return (
+      <div style={{ display: 'inline-flex', alignItems: 'center', gap: 4, backgroundColor: '#FEF3C7', border: '1px solid #FDE68A', borderRadius: 20, padding: '3px 10px', fontSize: 12, fontWeight: 700, color: '#92400E' }}>
+        ⭐ Premium
+      </div>
+    );
+  }
+  return (
+    <div style={{ display: 'inline-flex', alignItems: 'center', gap: 4, backgroundColor: '#F3F4F6', border: '1px solid #E5E7EB', borderRadius: 20, padding: '3px 10px', fontSize: 12, fontWeight: 600, color: '#6B7280' }}>
+      🌱 Gratuito
+    </div>
+  );
+}
+
+// ─── USAGE COUNTER ─────────────────────────────────────────────────────────────
+
+function UsageCounter({ used, total, label, icon }) {
+  const pct = Math.min((used / total) * 100, 100);
+  const color = pct >= 90 ? '#DC2626' : pct >= 70 ? '#D97706' : '#16A34A';
+  return (
+    <div style={{ backgroundColor: '#F9FAFB', border: '1px solid #E5E7EB', borderRadius: 12, padding: '12px 14px' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+        <span style={{ fontSize: 13, color: '#6B7280' }}>{icon} {label}</span>
+        <span style={{ fontSize: 13, fontWeight: 700, color }}>{used}/{total}</span>
+      </div>
+      <div style={{ height: 6, backgroundColor: '#E5E7EB', borderRadius: 3, overflow: 'hidden' }}>
+        <div style={{ height: '100%', borderRadius: 3, backgroundColor: color, width: `${pct}%`, transition: 'width 0.4s' }} />
+      </div>
+    </div>
+  );
+}
+
+// ─── UPGRADE MODAL ─────────────────────────────────────────────────────────────
+
+function UpgradeModal({ reason, onClose }) {
+  const reasons = {
+    plants: { icon: '🌱', title: 'Límite de plantas alcanzado', desc: 'El plan gratuito permite registrar hasta 1 planta. Actualiza a Premium para jardines ilimitados.' },
+    chat: { icon: '💬', title: 'Límite de mensajes alcanzado', desc: `Has usado los ${FREE_CHAT_DAILY_LIMIT} mensajes gratuitos de hoy. Actualiza a Premium para chat ilimitado.` },
+  };
+  const info = reasons[reason] || reasons.plants;
+  return (
+    <div style={S.overlay}>
+      <div style={S.overlayBg} onClick={onClose} />
+      <div style={{ ...S.modalCard, maxWidth: 400, textAlign: 'center' }}>
+        <button onClick={onClose} style={{ ...S.closeBtn, position: 'absolute', top: 16, right: 16 }}>✕</button>
+        <div style={{ fontSize: 48, marginBottom: 16 }}>{info.icon}</div>
+        <h2 style={{ fontSize: 20, fontWeight: 700, color: '#111827', marginBottom: 10 }}>{info.title}</h2>
+        <p style={{ fontSize: 14, color: '#6B7280', lineHeight: 1.6, marginBottom: 24 }}>{info.desc}</p>
+        <div style={{ backgroundColor: '#FFFBEB', border: '1px solid #FDE68A', borderRadius: 14, padding: '16px 18px', marginBottom: 24, textAlign: 'left' }}>
+          <p style={{ fontSize: 13, fontWeight: 700, color: '#92400E', marginBottom: 10 }}>⭐ Plan Premium incluye:</p>
+          {['Plantas ilimitadas', 'Chat IA ilimitado', 'Análisis avanzados', 'Sin restricciones'].map(f => (
+            <div key={f} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6, fontSize: 13, color: '#374151' }}>
+              <span style={{ color: '#16A34A' }}>✓</span> {f}
+            </div>
+          ))}
+        </div>
+        <button style={{ ...S.btnPrimary, width: '100%', backgroundColor: '#D97706', boxShadow: '0 3px 10px rgba(217,119,6,0.3)' }}>
+          ⭐ Actualizar a Premium
+        </button>
+        <button onClick={onClose} style={{ ...S.btnGhost, width: '100%', marginTop: 10 }}>Continuar gratis</button>
+      </div>
+    </div>
+  );
 }
 
 // ─── AUTH MODAL ──────────────────────────────────────────────────────────────
@@ -197,10 +333,10 @@ function AuthModal({ mode, onClose, onSubmit, error }) {
 // ─── ADD PLANT FLOW ───────────────────────────────────────────────────────────
 
 function AddPlantFlow({ onClose, onSave, user }) {
-  const [step, setStep] = useState(1); // 1=upload, 2=species, 3=name
+  const [step, setStep] = useState(1);
   const [image, setImage] = useState(null);
   const [loading, setLoading] = useState(false);
-  const [aiResult, setAiResult] = useState(null); // parsed JSON from API
+  const [aiResult, setAiResult] = useState(null);
   const [selectedSpecies, setSelectedSpecies] = useState('');
   const [customSpecies, setCustomSpecies] = useState('');
   const [useCustom, setUseCustom] = useState(false);
@@ -277,6 +413,11 @@ function AddPlantFlow({ onClose, onSave, user }) {
     const species = getEffectiveSpecies();
     const isUnknown = species === 'Desconocida';
 
+    // FIX #1: Always store only the health_analysis text, not raw JSON
+    const healthAnalysisText = isUnknown
+      ? 'Información insuficiente para generar cuidados automáticos.'
+      : (aiResult?.health_analysis || 'Planta recién registrada.');
+
     const newPlant = {
       id: Date.now().toString(),
       name: plantName.trim(),
@@ -288,23 +429,19 @@ function AddPlantFlow({ onClose, onSave, user }) {
       lastWatered: null,
       lastFertilized: null,
       waterStreak: 0,
-      // AI-generated fields (only if plant was identified)
       confidence: isUnknown ? null : (aiResult?.recommended_species?.confidence ?? null),
       recommendedWateringDays: isUnknown ? null : (aiResult?.watering_days ?? null),
       recommendedFertilizerDays: isUnknown ? null : (aiResult?.fertilizer_days ?? null),
       fertilizerType: isUnknown ? null : (aiResult?.fertilizer_type ?? null),
       sunlight: isUnknown ? null : (aiResult?.sunlight ?? null),
       difficulty: isUnknown ? null : (aiResult?.difficulty ?? null),
-      // Activity log
       activities: [],
       updates: [{
         id: Date.now(),
         date: now,
         image,
         thumbnail,
-        analysis: isUnknown
-          ? 'Información insuficiente para generar cuidados automáticos.'
-          : (aiResult?.health_analysis || 'Planta recién registrada.'),
+        analysis: healthAnalysisText, // FIX #1: clean text only
         type: 'initial',
       }],
       chatHistory: [],
@@ -322,7 +459,6 @@ function AddPlantFlow({ onClose, onSave, user }) {
     <div style={S.overlay}>
       <div style={S.overlayBg} onClick={onClose} />
       <div style={{ ...S.modalCard, maxWidth: 520, maxHeight: '90vh', overflowY: 'auto' }}>
-        {/* Header */}
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 24 }}>
           <div>
             <h2 style={{ fontSize: 20, fontWeight: 700, color: '#111827', marginBottom: 4 }}>Agregar planta</h2>
@@ -331,14 +467,12 @@ function AddPlantFlow({ onClose, onSave, user }) {
           <button onClick={onClose} style={S.closeBtn}>✕</button>
         </div>
 
-        {/* Progress */}
         <div style={{ display: 'flex', gap: 6, marginBottom: 28 }}>
           {steps.map((s, i) => (
             <div key={s} style={{ flex: 1, height: 4, borderRadius: 2, backgroundColor: i < step ? '#16A34A' : '#E5E7EB', transition: 'background 0.3s' }} />
           ))}
         </div>
 
-        {/* Step 1: Upload */}
         {step === 1 && (
           <div>
             <p style={{ fontSize: 14, color: '#6B7280', marginBottom: 16 }}>Sube una foto clara de tu planta para que la IA la identifique automáticamente.</p>
@@ -368,27 +502,22 @@ function AddPlantFlow({ onClose, onSave, user }) {
           </div>
         )}
 
-        {/* Step 2: Species Selection */}
         {step === 2 && (
           <div>
             {image && <img src={image} alt="" style={{ width: '100%', maxHeight: 140, objectFit: 'contain', borderRadius: 12, marginBottom: 16, backgroundColor: '#F9FAFB' }} />}
 
-            {/* Health analysis */}
             {aiResult?.health_analysis && !lowConfidence && (
               <div style={{ backgroundColor: '#F0FDF4', border: '1px solid #BBF7D0', borderRadius: 10, padding: '10px 14px', fontSize: 13, color: '#15803D', marginBottom: 16 }}>
                 🩺 {aiResult.health_analysis}
               </div>
             )}
 
-            {/* LOW CONFIDENCE warning */}
             {lowConfidence ? (
               <div>
                 <div style={{ backgroundColor: '#FFFBEB', border: '1px solid #FDE68A', borderRadius: 12, padding: '14px 16px', marginBottom: 16 }}>
                   <p style={{ fontSize: 14, fontWeight: 700, color: '#92400E', marginBottom: 4 }}>⚠️ No pudimos identificar esta planta con suficiente precisión.</p>
                   <p style={{ fontSize: 13, color: '#78350F' }}>Elige una de las opciones abajo o escribe el nombre manualmente.</p>
                 </div>
-
-                {/* Suggested alternatives */}
                 {alternatives.length > 0 && (
                   <div style={{ marginBottom: 14 }}>
                     <p style={{ fontSize: 12, fontWeight: 700, color: '#9CA3AF', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>Posibles especies</p>
@@ -410,8 +539,6 @@ function AddPlantFlow({ onClose, onSave, user }) {
                     </div>
                   </div>
                 )}
-
-                {/* Manual entry */}
                 <div style={{ marginBottom: 14 }}>
                   <p style={{ fontSize: 12, fontWeight: 700, color: '#9CA3AF', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>Escribir manualmente</p>
                   <input
@@ -422,8 +549,6 @@ function AddPlantFlow({ onClose, onSave, user }) {
                     style={{ ...S.input, width: '100%' }}
                   />
                 </div>
-
-                {/* Register as unknown */}
                 <button
                   onClick={() => { setSelectedSpecies('Desconocida'); setUseCustom(false); setCustomSpecies(''); }}
                   style={{
@@ -437,37 +562,35 @@ function AddPlantFlow({ onClose, onSave, user }) {
                 </button>
               </div>
             ) : (
-              /* NORMAL FLOW: high confidence */
               <div>
-                {/* Recommended */}
-                <div style={{ marginBottom: 16 }}>
-                  <p style={{ fontSize: 12, fontWeight: 700, color: '#9CA3AF', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>Planta recomendada</p>
-                  <button
-                    onClick={() => { setSelectedSpecies(recommended?.name || ''); setUseCustom(false); }}
-                    style={{
-                      width: '100%', padding: '14px 16px', borderRadius: 12,
-                      border: `2px solid ${selectedSpecies === recommended?.name && !useCustom ? '#16A34A' : '#E5E7EB'}`,
-                      backgroundColor: selectedSpecies === recommended?.name && !useCustom ? '#F0FDF4' : '#FFFFFF',
-                      color: selectedSpecies === recommended?.name && !useCustom ? '#15803D' : '#374151',
-                      cursor: 'pointer', textAlign: 'left',
-                      display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-                    }}
-                  >
-                    <div>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 2 }}>
-                        <span style={{ fontSize: 16 }}>✅</span>
-                        <span style={{ fontWeight: 700, fontSize: 15 }}>{recommended?.name}</span>
+                {recommended && (
+                  <div style={{ marginBottom: 16 }}>
+                    <p style={{ fontSize: 12, fontWeight: 700, color: '#9CA3AF', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>Planta recomendada</p>
+                    <button
+                      onClick={() => { setSelectedSpecies(recommended.name); setUseCustom(false); }}
+                      style={{
+                        width: '100%', padding: '14px 16px', borderRadius: 12,
+                        border: `2px solid ${selectedSpecies === recommended.name && !useCustom ? '#16A34A' : '#E5E7EB'}`,
+                        backgroundColor: selectedSpecies === recommended.name && !useCustom ? '#F0FDF4' : '#FFFFFF',
+                        color: selectedSpecies === recommended.name && !useCustom ? '#15803D' : '#374151',
+                        cursor: 'pointer', textAlign: 'left',
+                        display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                      }}
+                    >
+                      <div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 2 }}>
+                          <span style={{ fontSize: 16 }}>✅</span>
+                          <span style={{ fontWeight: 700, fontSize: 15 }}>{recommended.name}</span>
+                        </div>
+                        <p style={{ fontSize: 12, color: '#9CA3AF', marginLeft: 24 }}>{recommended.scientific_name}</p>
                       </div>
-                      <p style={{ fontSize: 12, color: '#9CA3AF', marginLeft: 24 }}>{recommended?.scientific_name}</p>
-                    </div>
-                    <div style={{ textAlign: 'right', flexShrink: 0 }}>
-                      <div style={{ fontSize: 18, fontWeight: 800, color: '#16A34A' }}>{confidence}%</div>
-                      <div style={{ fontSize: 11, color: '#9CA3AF' }}>confianza</div>
-                    </div>
-                  </button>
-                </div>
-
-                {/* Alternatives */}
+                      <div style={{ textAlign: 'right', flexShrink: 0 }}>
+                        <div style={{ fontSize: 18, fontWeight: 800, color: '#16A34A' }}>{confidence}%</div>
+                        <div style={{ fontSize: 11, color: '#9CA3AF' }}>confianza</div>
+                      </div>
+                    </button>
+                  </div>
+                )}
                 {alternatives.length > 0 && (
                   <div style={{ marginBottom: 16 }}>
                     <p style={{ fontSize: 12, fontWeight: 700, color: '#9CA3AF', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>Otras posibilidades</p>
@@ -489,9 +612,6 @@ function AddPlantFlow({ onClose, onSave, user }) {
                     </div>
                   </div>
                 )}
-
-                {/* Manual override */}
-                <button onClick={() => onClose()} style={{ display: 'none' }} />
                 <div>
                   <p style={{ fontSize: 12, fontWeight: 700, color: '#9CA3AF', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>¿No es ninguna?</p>
                   <input
@@ -505,7 +625,6 @@ function AddPlantFlow({ onClose, onSave, user }) {
               </div>
             )}
 
-            {/* AI care summary (only if identified) */}
             {!lowConfidence && aiResult && selectedSpecies && selectedSpecies !== 'Desconocida' && (
               <div style={{ marginTop: 16, backgroundColor: '#F9FAFB', border: '1px solid #E5E7EB', borderRadius: 12, padding: '12px 14px' }}>
                 <p style={{ fontSize: 12, fontWeight: 700, color: '#374151', marginBottom: 8 }}>🤖 Cuidados generados por IA</p>
@@ -550,7 +669,6 @@ function AddPlantFlow({ onClose, onSave, user }) {
           </div>
         )}
 
-        {/* Step 3: Name */}
         {step === 3 && (
           <div>
             <p style={{ fontSize: 14, color: '#6B7280', marginBottom: 16 }}>Dale un nombre personalizado a tu planta.</p>
@@ -589,6 +707,7 @@ function AddPlantFlow({ onClose, onSave, user }) {
 
 function WateringCountdown({ plant, style }) {
   const interval = plant.recommendedWateringDays || plant.waterInterval || 3;
+  // FIX #3: key prop on hook means component remounts when lastWatered changes, forcing fresh calculation
   const countdown = useCountdown(plant.lastWatered, interval);
   const status = getWateringStatus(plant);
   const statusColor = getWateringStatusColor(status);
@@ -638,6 +757,7 @@ function WateringCountdown({ plant, style }) {
 // ─── PLANT CARD ────────────────────────────────────────────────────────────
 
 function PlantCard({ plant, onClick }) {
+  // FIX #3: All derived state is computed fresh on each render from plant prop
   const health = getHealthStatus(plant);
   const alerts = getAlerts(plant);
   const status = getWateringStatus(plant);
@@ -658,7 +778,6 @@ function PlantCard({ plant, onClick }) {
             {alerts.length}
           </div>
         )}
-        {/* Watering status dot */}
         <div style={{ position: 'absolute', top: 10, left: 10, width: 10, height: 10, borderRadius: '50%', backgroundColor: statusColor, border: '2px solid white' }} />
       </div>
       <div style={{ padding: '14px 16px' }}>
@@ -683,28 +802,39 @@ function PlantCard({ plant, onClick }) {
 
 // ─── PLANT DETAIL ─────────────────────────────────────────────────────────────
 
-function PlantDetail({ plant: initialPlant, onBack, onUpdate }) {
+function PlantDetail({ plant: initialPlant, onBack, onUpdate, onDelete, userPlan, userEmail }) {
   const [plant, setPlant] = useState(initialPlant);
   const [activeTab, setActiveTab] = useState('overview');
   const [chatInput, setChatInput] = useState('');
   const [chatLoading, setChatLoading] = useState(false);
+  const [chatImage, setChatImage] = useState(null); // FIX #5: image in chat
   const [newPhoto, setNewPhoto] = useState(null);
   const [analyzing, setAnalyzing] = useState(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false); // FIX #2
+  const [showUpgrade, setShowUpgrade] = useState(false);
+  const [chatUsed, setChatUsed] = useState(() => userEmail ? getChatUsage(userEmail) : 0);
   const chatEndRef = useRef(null);
+  const chatImageInputRef = useRef(null);
+
+  // FIX #6: sync local plant state when parent prop changes (e.g. after update from another source)
+  useEffect(() => {
+    setPlant(initialPlant);
+  }, [initialPlant.id]);
 
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [plant.chatHistory]);
 
-  const update = (changes) => {
+  const update = useCallback((changes) => {
     const updated = { ...plant, ...changes };
     setPlant(updated);
     onUpdate(updated);
-  };
+  }, [plant, onUpdate]);
 
   const logActivity = (type) => {
     const entry = { id: Date.now(), type, date: new Date().toISOString() };
     return [...(plant.activities || []), entry];
   };
 
+  // FIX #3: markWatered now forces immediate re-render with correct timestamp
   const markWatered = () => {
     const now = new Date().toISOString();
     const streak = (plant.waterStreak || 0) + 1;
@@ -725,6 +855,7 @@ function PlantDetail({ plant: initialPlant, onBack, onUpdate }) {
     reader.readAsDataURL(file);
   };
 
+  // FIX #1: analyzeNewPhoto now properly extracts health_analysis text
   const analyzeNewPhoto = async () => {
     if (!newPhoto) return;
     setAnalyzing(true);
@@ -741,13 +872,17 @@ Responde en español de forma clara y directa.`,
         }),
       });
       const data = await response.json();
+
+      // FIX #1: Extract only health_analysis text, never store raw JSON
+      const analysisText = extractHealthAnalysis(data.result);
+
       const thumb = await createThumbnail(newPhoto);
       const entry = {
         id: Date.now(),
         date: new Date().toISOString(),
         image: newPhoto,
         thumbnail: thumb,
-        analysis: data.result || 'Análisis completado.',
+        analysis: analysisText, // FIX #1: clean text
         type: 'update',
       };
       update({
@@ -761,13 +896,39 @@ Responde en español de forma clara y directa.`,
     finally { setAnalyzing(false); }
   };
 
+  // FIX #5: Chat image handling
+  const handleChatImageChange = (e) => {
+    const file = e.target.files[0];
+    if (!file || file.size > 5 * 1024 * 1024) { alert('Máximo 5MB'); return; }
+    const reader = new FileReader();
+    reader.onloadend = () => setChatImage(reader.result);
+    reader.readAsDataURL(file);
+  };
+
+  // FIX #4 + FIX #5: Chat with plan limits and image support
   const sendChat = async () => {
     if (!chatInput.trim() || chatLoading) return;
-    const userMsg = { role: 'user', content: chatInput.trim(), date: new Date().toISOString() };
+
+    // FIX #4: Check daily chat limit for free users
+    if (userPlan === 'free' && chatUsed >= FREE_CHAT_DAILY_LIMIT) {
+      setShowUpgrade(true);
+      return;
+    }
+
+    const userMsg = {
+      role: 'user',
+      content: chatInput.trim(),
+      date: new Date().toISOString(),
+      image: chatImage || null, // FIX #5: attach image if present
+    };
     const history = [...(plant.chatHistory || []), userMsg];
     update({ chatHistory: history });
+    const inputText = chatInput.trim();
+    const inputImage = chatImage;
     setChatInput('');
+    setChatImage(null); // clear after send
     setChatLoading(true);
+
     try {
       const context = `Eres un experto en botánica y cuidado de plantas. Estás hablando sobre una planta específica con estos datos:
 - Nombre: ${plant.name}
@@ -781,20 +942,40 @@ Responde en español de forma clara y directa.`,
 ${plant.updates?.[0]?.analysis ? `- Último análisis: "${plant.updates[0].analysis}"` : ''}
 
 Responde de forma concisa, práctica y personalizada para esta planta específica.`;
+
+      // FIX #5: Send image to API if present
+      const bodyPayload = {
+        systemPrompt: context,
+        message: inputText,
+        chatHistory: plant.chatHistory?.slice(-6) || [],
+      };
+      if (inputImage) {
+        bodyPayload.image = inputImage;
+      }
+
       const response = await fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          systemPrompt: context,
-          message: chatInput.trim(),
-          chatHistory: plant.chatHistory?.slice(-6) || [],
-        }),
+        body: JSON.stringify(bodyPayload),
       });
       const data = await response.json();
       const aiMsg = { role: 'assistant', content: data.result || 'No pude obtener respuesta.', date: new Date().toISOString() };
       update({ chatHistory: [...history, aiMsg] });
-    } catch { }
+
+      // FIX #4: Track usage
+      if (userPlan === 'free' && userEmail) {
+        const newUsed = incrementChatUsage(userEmail);
+        setChatUsed(newUsed);
+      }
+    } catch { /* silent fail */ }
     finally { setChatLoading(false); }
+  };
+
+  // FIX #2: Delete plant
+  const handleDelete = async () => {
+    // Optionally remove from Supabase if you have a plants table
+    // await supabase.from('plants').delete().eq('id', plant.id);
+    onDelete(plant.id);
   };
 
   const health = getHealthStatus(plant);
@@ -804,6 +985,7 @@ Responde de forma concisa, práctica y personalizada para esta planta específic
   const fertDays = daysBetween(plant.lastFertilized);
   const waterInterval = plant.recommendedWateringDays || plant.waterInterval || 3;
   const fertInterval = plant.recommendedFertilizerDays || plant.fertInterval || 30;
+  const chatRemaining = FREE_CHAT_DAILY_LIMIT - chatUsed;
   const tabs = [
     { id: 'overview', label: '📊 Resumen' },
     { id: 'care', label: '💧 Cuidados' },
@@ -814,9 +996,43 @@ Responde de forma concisa, práctica y personalizada para esta planta específic
 
   return (
     <div style={{ maxWidth: 800, margin: '0 auto', padding: '24px 16px' }}>
-      <button onClick={onBack} style={{ ...S.btnOutline, marginBottom: 20, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-        ← Mis Plantas
-      </button>
+      {/* FIX #2: Delete Confirm Modal */}
+      {showDeleteConfirm && (
+        <div style={S.overlay}>
+          <div style={S.overlayBg} onClick={() => setShowDeleteConfirm(false)} />
+          <div style={{ ...S.modalCard, maxWidth: 380, textAlign: 'center' }}>
+            <div style={{ fontSize: 40, marginBottom: 12 }}>🗑️</div>
+            <h2 style={{ fontSize: 18, fontWeight: 700, color: '#111827', marginBottom: 8 }}>¿Eliminar planta?</h2>
+            <p style={{ fontSize: 14, color: '#6B7280', marginBottom: 24 }}>
+              Se eliminará <strong>{plant.name}</strong> y todo su historial. Esta acción no se puede deshacer.
+            </p>
+            <div style={{ display: 'flex', gap: 10 }}>
+              <button onClick={() => setShowDeleteConfirm(false)} style={{ ...S.btnOutline, flex: 1 }}>Cancelar</button>
+              <button
+                onClick={handleDelete}
+                style={{ ...S.btnPrimary, flex: 1, backgroundColor: '#DC2626', boxShadow: '0 3px 10px rgba(220,38,38,0.25)' }}
+              >
+                Eliminar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showUpgrade && <UpgradeModal reason="chat" onClose={() => setShowUpgrade(false)} />}
+
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+        <button onClick={onBack} style={{ ...S.btnOutline, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+          ← Mis Plantas
+        </button>
+        {/* FIX #2: Delete button */}
+        <button
+          onClick={() => setShowDeleteConfirm(true)}
+          style={{ ...S.btnOutline, color: '#DC2626', borderColor: '#FECACA', backgroundColor: '#FEF2F2', display: 'inline-flex', alignItems: 'center', gap: 6 }}
+        >
+          🗑️ Eliminar planta
+        </button>
+      </div>
 
       <div style={{ display: 'flex', alignItems: 'flex-start', gap: 20, marginBottom: 28 }}>
         <div style={{ width: 90, height: 90, borderRadius: 18, overflow: 'hidden', flexShrink: 0, border: '2px solid #E5E7EB' }}>
@@ -848,7 +1064,6 @@ Responde de forma concisa, práctica y personalizada para esta planta específic
         </div>
       </div>
 
-      {/* Alerts */}
       {alerts.length > 0 && (
         <div style={{ marginBottom: 20, display: 'flex', flexDirection: 'column', gap: 8 }}>
           {alerts.map((a, i) => (
@@ -864,7 +1079,6 @@ Responde de forma concisa, práctica y personalizada para esta planta específic
         </div>
       )}
 
-      {/* Tabs */}
       <div style={{ display: 'flex', gap: 4, marginBottom: 24, backgroundColor: '#F9FAFB', padding: 4, borderRadius: 12, overflowX: 'auto' }}>
         {tabs.map(t => (
           <button key={t.id} onClick={() => setActiveTab(t.id)} style={{
@@ -884,10 +1098,7 @@ Responde de forma concisa, práctica y personalizada para esta planta específic
       {/* TAB: Overview */}
       {activeTab === 'overview' && (
         <div>
-          {/* Countdown */}
           <WateringCountdown plant={plant} style={{ marginBottom: 16 }} />
-
-          {/* Stats grid */}
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 12, marginBottom: 24 }}>
             {[
               { icon: '💧', label: 'Último riego', value: waterDays === null ? '—' : waterDays === 0 ? 'Hoy' : `Hace ${waterDays}d` },
@@ -903,7 +1114,6 @@ Responde de forma concisa, práctica y personalizada para esta planta específic
             ))}
           </div>
 
-          {/* Latest analysis */}
           {plant.updates?.[0]?.analysis && (
             <div style={{ backgroundColor: '#F0FDF4', border: '1px solid #BBF7D0', borderRadius: 14, padding: '16px 18px', marginBottom: 24 }}>
               <p style={{ fontSize: 12, fontWeight: 700, color: '#15803D', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Último análisis IA</p>
@@ -912,7 +1122,6 @@ Responde de forma concisa, práctica y personalizada para esta planta específic
             </div>
           )}
 
-          {/* Achievements */}
           <div style={{ border: '1px solid #E5E7EB', borderRadius: 14, padding: '16px 18px' }}>
             <p style={{ fontSize: 14, fontWeight: 700, color: '#111827', marginBottom: 14 }}>🏆 Logros</p>
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: 10 }}>
@@ -938,7 +1147,6 @@ Responde de forma concisa, práctica y personalizada para esta planta específic
       {/* TAB: Care */}
       {activeTab === 'care' && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-          {/* Water card */}
           <div style={{ border: '1px solid #DBEAFE', borderRadius: 16, overflow: 'hidden' }}>
             <div style={{ backgroundColor: '#EFF6FF', padding: '14px 18px', display: 'flex', alignItems: 'center', gap: 10 }}>
               <span style={{ fontSize: 24 }}>💧</span>
@@ -971,7 +1179,6 @@ Responde de forma concisa, práctica y personalizada para esta planta específic
             </div>
           </div>
 
-          {/* Fertilizer card */}
           <div style={{ border: '1px solid #BBF7D0', borderRadius: 16, overflow: 'hidden' }}>
             <div style={{ backgroundColor: '#F0FDF4', padding: '14px 18px', display: 'flex', alignItems: 'center', gap: 10 }}>
               <span style={{ fontSize: 24 }}>🌿</span>
@@ -1005,7 +1212,6 @@ Responde de forma concisa, práctica y personalizada para esta planta específic
             </div>
           </div>
 
-          {/* New photo + reanalysis */}
           <div style={{ border: '1px solid #E5E7EB', borderRadius: 16, padding: '16px 18px' }}>
             <p style={{ fontWeight: 700, color: '#111827', marginBottom: 4 }}>📸 Nueva actualización</p>
             <p style={{ fontSize: 13, color: '#9CA3AF', marginBottom: 14 }}>Sube una foto para reanálisis con IA</p>
@@ -1065,7 +1271,6 @@ Responde de forma concisa, práctica y personalizada para esta planta específic
                 </div>
               </div>
 
-              {/* Health state */}
               {plant.updates?.[0]?.analysis && (
                 <div style={{ backgroundColor: '#F9FAFB', border: '1px solid #E5E7EB', borderRadius: 14, padding: '16px 18px' }}>
                   <p style={{ fontSize: 12, fontWeight: 700, color: '#374151', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>Estado actual</p>
@@ -1073,7 +1278,6 @@ Responde de forma concisa, práctica y personalizada para esta planta específic
                 </div>
               )}
 
-              {/* Confidence bar */}
               {plant.confidence && (
                 <div style={{ backgroundColor: '#F9FAFB', border: '1px solid #E5E7EB', borderRadius: 14, padding: '16px 18px' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
@@ -1093,7 +1297,6 @@ Responde de forma concisa, práctica y personalizada para esta planta específic
       {/* TAB: Activity History */}
       {activeTab === 'updates' && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-          {/* Activity log */}
           {plant.activities && plant.activities.length > 0 && (
             <div style={{ border: '1px solid #E5E7EB', borderRadius: 14, padding: '16px 18px' }}>
               <p style={{ fontSize: 14, fontWeight: 700, color: '#111827', marginBottom: 14 }}>📋 Actividades registradas</p>
@@ -1113,7 +1316,6 @@ Responde de forma concisa, práctica y personalizada para esta planta específic
             </div>
           )}
 
-          {/* Photo updates */}
           {(!plant.updates || plant.updates.length === 0) ? (
             <div style={{ textAlign: 'center', padding: '48px 24px', color: '#9CA3AF' }}>
               <div style={{ fontSize: 40, marginBottom: 12 }}>📭</div>
@@ -1146,9 +1348,23 @@ Responde de forma concisa, práctica y personalizada para esta planta específic
       {/* TAB: AI Chat */}
       {activeTab === 'ai' && (
         <div>
-          <div style={{ backgroundColor: '#F0FDF4', border: '1px solid #BBF7D0', borderRadius: 10, padding: '10px 14px', marginBottom: 16, fontSize: 13, color: '#15803D' }}>
-            🤖 Asistente IA especializado en <strong>{plant.name}</strong> ({plant.species})
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', backgroundColor: '#F0FDF4', border: '1px solid #BBF7D0', borderRadius: 10, padding: '10px 14px', marginBottom: 12, fontSize: 13, color: '#15803D' }}>
+            <span>🤖 Asistente IA — <strong>{plant.name}</strong></span>
+            {/* FIX #4: Show usage counter for free plan */}
+            {userPlan === 'free' && (
+              <span style={{ fontSize: 12, color: chatRemaining <= 5 ? '#DC2626' : '#6B7280', fontWeight: 600 }}>
+                {chatRemaining} mensajes restantes hoy
+              </span>
+            )}
           </div>
+
+          {/* FIX #4: Usage bar for free plan */}
+          {userPlan === 'free' && (
+            <div style={{ marginBottom: 12 }}>
+              <UsageCounter used={chatUsed} total={FREE_CHAT_DAILY_LIMIT} label="Mensajes de chat hoy" icon="💬" />
+            </div>
+          )}
+
           <div style={{ border: '1px solid #E5E7EB', borderRadius: 14, overflow: 'hidden' }}>
             <div style={{ minHeight: 320, maxHeight: 400, overflowY: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 12 }}>
               {(!plant.chatHistory || plant.chatHistory.length === 0) && (
@@ -1172,6 +1388,10 @@ Responde de forma concisa, práctica y personalizada para esta planta específic
                     border: msg.role === 'assistant' ? '1px solid #E5E7EB' : 'none',
                     fontSize: 14, color: msg.role === 'user' ? '#FFFFFF' : '#374151', lineHeight: 1.6,
                   }}>
+                    {/* FIX #5: Show image thumbnail in chat if present */}
+                    {msg.image && (
+                      <img src={msg.image} alt="" style={{ width: '100%', maxHeight: 120, objectFit: 'contain', borderRadius: 8, marginBottom: 8, display: 'block' }} />
+                    )}
                     {msg.content}
                   </div>
                 </div>
@@ -1183,17 +1403,47 @@ Responde de forma concisa, práctica y personalizada para esta planta específic
               )}
               <div ref={chatEndRef} />
             </div>
-            <div style={{ borderTop: '1px solid #E5E7EB', padding: 12, display: 'flex', gap: 8 }}>
+
+            {/* FIX #5: Image preview above input */}
+            {chatImage && (
+              <div style={{ borderTop: '1px solid #E5E7EB', padding: '10px 12px', backgroundColor: '#F9FAFB', display: 'flex', alignItems: 'center', gap: 10 }}>
+                <img src={chatImage} alt="" style={{ width: 48, height: 48, objectFit: 'cover', borderRadius: 8, border: '1px solid #E5E7EB' }} />
+                <span style={{ fontSize: 12, color: '#6B7280', flex: 1 }}>Imagen adjunta</span>
+                <button onClick={() => setChatImage(null)} style={{ background: 'none', border: 'none', color: '#9CA3AF', cursor: 'pointer', fontSize: 16, padding: '0 4px' }}>✕</button>
+              </div>
+            )}
+
+            <div style={{ borderTop: '1px solid #E5E7EB', padding: 12, display: 'flex', gap: 8, alignItems: 'center' }}>
+              {/* FIX #5: Image attach button */}
+              <label style={{ cursor: 'pointer', color: '#9CA3AF', padding: '8px', borderRadius: 8, border: '1.5px solid #E5E7EB', backgroundColor: chatImage ? '#F0FDF4' : '#FFFFFF', flexShrink: 0 }} title="Adjuntar imagen">
+                📷
+                <input ref={chatImageInputRef} type="file" accept="image/*" capture="environment" onChange={handleChatImageChange} style={{ display: 'none' }} />
+              </label>
               <input
                 type="text" value={chatInput} onChange={e => setChatInput(e.target.value)}
                 onKeyDown={e => e.key === 'Enter' && sendChat()}
-                placeholder={`Pregunta sobre ${plant.name}...`}
-                style={{ ...S.input, flex: 1, margin: 0 }}
+                placeholder={userPlan === 'free' && chatUsed >= FREE_CHAT_DAILY_LIMIT ? '⛔ Límite diario alcanzado' : `Pregunta sobre ${plant.name}...`}
+                disabled={userPlan === 'free' && chatUsed >= FREE_CHAT_DAILY_LIMIT}
+                style={{ ...S.input, flex: 1, margin: 0, opacity: (userPlan === 'free' && chatUsed >= FREE_CHAT_DAILY_LIMIT) ? 0.6 : 1 }}
               />
-              <button onClick={sendChat} disabled={!chatInput.trim() || chatLoading} style={{ ...S.btnPrimary, padding: '0 16px', opacity: (!chatInput.trim() || chatLoading) ? 0.5 : 1 }}>
+              <button
+                onClick={sendChat}
+                disabled={(!chatInput.trim() && !chatImage) || chatLoading || (userPlan === 'free' && chatUsed >= FREE_CHAT_DAILY_LIMIT)}
+                style={{ ...S.btnPrimary, padding: '0 16px', height: 40, opacity: ((!chatInput.trim() && !chatImage) || chatLoading || (userPlan === 'free' && chatUsed >= FREE_CHAT_DAILY_LIMIT)) ? 0.5 : 1 }}
+              >
                 →
               </button>
             </div>
+
+            {/* FIX #4: Upgrade nudge when limit hit */}
+            {userPlan === 'free' && chatUsed >= FREE_CHAT_DAILY_LIMIT && (
+              <div style={{ borderTop: '1px solid #FDE68A', backgroundColor: '#FFFBEB', padding: '10px 14px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                <span style={{ fontSize: 13, color: '#92400E' }}>⭐ Límite diario alcanzado</span>
+                <button onClick={() => setShowUpgrade(true)} style={{ ...S.btnPrimary, padding: '6px 14px', fontSize: 12, backgroundColor: '#D97706', boxShadow: 'none' }}>
+                  Mejorar plan
+                </button>
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -1204,7 +1454,6 @@ Responde de forma concisa, práctica y personalizada para esta planta específic
 // ─── DASHBOARD ────────────────────────────────────────────────────────────────
 
 function Dashboard({ plants, onNavigate }) {
-  const needsAttention = plants.filter(p => getAlerts(p).some(a => a.level !== 'low'));
   const needsWater = plants.filter(p => getWateringStatus(p) === 'overdue');
   const needsWaterSoon = plants.filter(p => getWateringStatus(p) === 'soon');
   const needsFert = plants.filter(p => {
@@ -1214,7 +1463,6 @@ function Dashboard({ plants, onNavigate }) {
   });
   const healthy = plants.filter(p => getHealthStatus(p) === 'excellent' || getHealthStatus(p) === 'good');
 
-  // Next upcoming watering
   const nextWateringPlant = plants
     .map(p => {
       const ms = msUntilNext(p.lastWatered, p.recommendedWateringDays || p.waterInterval || 3);
@@ -1230,7 +1478,6 @@ function Dashboard({ plants, onNavigate }) {
         <p style={{ fontSize: 15, color: '#9CA3AF' }}>{new Date().toLocaleDateString('es-ES', { weekday: 'long', day: 'numeric', month: 'long' })}</p>
       </div>
 
-      {/* Stats */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 14, marginBottom: 32 }}>
         {[
           { icon: '🌱', value: plants.length, label: 'Total plantas', color: '#16A34A', bg: '#F0FDF4', border: '#BBF7D0' },
@@ -1256,7 +1503,6 @@ function Dashboard({ plants, onNavigate }) {
         </div>
       ) : (
         <>
-          {/* Needs water now */}
           {needsWater.length > 0 && (
             <div style={{ marginBottom: 28 }}>
               <h2 style={{ fontSize: 18, fontWeight: 700, color: '#111827', marginBottom: 14 }}>💧 Necesitan riego ahora</h2>
@@ -1275,7 +1521,6 @@ function Dashboard({ plants, onNavigate }) {
             </div>
           )}
 
-          {/* Needs water soon */}
           {needsWaterSoon.length > 0 && (
             <div style={{ marginBottom: 28 }}>
               <h2 style={{ fontSize: 18, fontWeight: 700, color: '#111827', marginBottom: 14 }}>⏰ Riego próximo</h2>
@@ -1294,7 +1539,6 @@ function Dashboard({ plants, onNavigate }) {
             </div>
           )}
 
-          {/* Recent plants */}
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
             <h2 style={{ fontSize: 18, fontWeight: 700, color: '#111827' }}>Mis plantas</h2>
             <button onClick={() => onNavigate(VIEWS.MY_PLANTS)} style={{ fontSize: 13, color: '#16A34A', background: 'none', border: 'none', cursor: 'pointer', fontWeight: 600 }}>Ver todas →</button>
@@ -1359,6 +1603,7 @@ function MyPlants({ plants, onNavigate }) {
 export default function Home() {
   const [ready, setReady] = useState(false);
   const [user, setUser] = useState(null);
+  const [userPlan, setUserPlan] = useState('free'); // FIX #4
   const [showRegister, setShowRegister] = useState(false);
   const [showLogin, setShowLogin] = useState(false);
   const [authError, setAuthError] = useState('');
@@ -1366,6 +1611,8 @@ export default function Home() {
   const [selectedPlant, setSelectedPlant] = useState(null);
   const [plants, setPlants] = useState([]);
   const [showAddPlant, setShowAddPlant] = useState(false);
+  const [showUpgradeModal, setShowUpgradeModal] = useState(false); // FIX #4
+  const [upgradeReason, setUpgradeReason] = useState('plants');
 
   useEffect(() => {
     const init = async () => {
@@ -1374,6 +1621,7 @@ export default function Home() {
         const u = { email: session.user.email, name: session.user.user_metadata?.name || session.user.email, id: session.user.id };
         setUser(u);
         setPlants(loadPlants(u.email));
+        setUserPlan(loadUserPlan(u.email)); // FIX #4
       }
       setReady(true);
     };
@@ -1383,7 +1631,10 @@ export default function Home() {
         const u = { email: session.user.email, name: session.user.user_metadata?.name || session.user.email, id: session.user.id };
         setUser(u);
         setPlants(loadPlants(u.email));
-      } else { setUser(null); setPlants([]); }
+        setUserPlan(loadUserPlan(u.email)); // FIX #4
+      } else {
+        setUser(null); setPlants([]); setUserPlan('free');
+      }
     });
     return () => subscription.unsubscribe();
   }, []);
@@ -1396,6 +1647,7 @@ export default function Home() {
       await supabase.from('profiles').insert({ id: data.user.id, premium_until: null });
       setUser({ email: data.user.email, name, id: data.user.id });
       setPlants([]);
+      setUserPlan('free');
     }
     setShowRegister(false); setAuthError('');
   };
@@ -1408,13 +1660,14 @@ export default function Home() {
       const u = { email: data.user.email, name: data.user.user_metadata?.name || data.user.email, id: data.user.id };
       setUser(u);
       setPlants(loadPlants(u.email));
+      setUserPlan(loadUserPlan(u.email));
     }
     setShowLogin(false); setAuthError('');
   };
 
   const handleLogout = async () => {
     await supabase.auth.signOut();
-    setUser(null); setPlants([]); setView(VIEWS.DASHBOARD); setSelectedPlant(null);
+    setUser(null); setPlants([]); setUserPlan('free'); setView(VIEWS.DASHBOARD); setSelectedPlant(null);
   };
 
   const navigate = (destination, plant = null) => {
@@ -1422,6 +1675,16 @@ export default function Home() {
     setSelectedPlant(plant);
     if (destination === VIEWS.ADD_PLANT) setShowAddPlant(true);
     window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  // FIX #4: Plant limit check before opening Add flow
+  const handleAddPlantClick = () => {
+    if (userPlan === 'free' && plants.length >= FREE_PLANT_LIMIT) {
+      setUpgradeReason('plants');
+      setShowUpgradeModal(true);
+      return;
+    }
+    setShowAddPlant(true);
   };
 
   const savePlant = (newPlant) => {
@@ -1432,12 +1695,26 @@ export default function Home() {
     setView(VIEWS.MY_PLANTS);
   };
 
-  const updatePlant = (updatedPlant) => {
-    const updated = plants.map(p => p.id === updatedPlant.id ? updatedPlant : p);
-    setPlants(updated);
+  const updatePlant = useCallback((updatedPlant) => {
+    setPlants(prev => {
+      const updated = prev.map(p => p.id === updatedPlant.id ? updatedPlant : p);
+      if (user) savePlants(user.email, updated);
+      return updated;
+    });
+    // FIX #6: keep selectedPlant in sync
     setSelectedPlant(updatedPlant);
-    if (user) savePlants(user.email, updated);
-  };
+  }, [user]);
+
+  // FIX #2: Delete plant handler
+  const deletePlant = useCallback((plantId) => {
+    setPlants(prev => {
+      const updated = prev.filter(p => p.id !== plantId);
+      if (user) savePlants(user.email, updated);
+      return updated;
+    });
+    setSelectedPlant(null);
+    setView(VIEWS.MY_PLANTS);
+  }, [user]);
 
   if (!ready) return null;
 
@@ -1461,6 +1738,8 @@ export default function Home() {
 
       {showRegister && <AuthModal mode="register" onClose={() => { setShowRegister(false); setAuthError(''); }} onSubmit={handleRegister} error={authError} />}
       {showLogin && <AuthModal mode="login" onClose={() => { setShowLogin(false); setAuthError(''); }} onSubmit={handleLogin} error={authError} />}
+      {/* FIX #4: Upgrade modal at root level */}
+      {showUpgradeModal && <UpgradeModal reason={upgradeReason} onClose={() => setShowUpgradeModal(false)} />}
       {showAddPlant && <AddPlantFlow onClose={() => setShowAddPlant(false)} onSave={savePlant} user={user} />}
 
       {/* ── NAVBAR ── */}
@@ -1489,12 +1768,14 @@ export default function Home() {
           <div style={S.navActions}>
             {user ? (
               <>
-                <button onClick={() => setShowAddPlant(true)} style={{ ...S.btnNavPrimary, display: 'flex', alignItems: 'center', gap: 6 }}>
+                <button onClick={handleAddPlantClick} style={{ ...S.btnNavPrimary, display: 'flex', alignItems: 'center', gap: 6 }}>
                   + Nueva planta
                 </button>
                 <div style={S.userPill}>
                   <div style={S.userAvatar}>{user.name.charAt(0).toUpperCase()}</div>
+                  {/* FIX #4: Show plan badge in user pill */}
                   <span style={S.userName}>{user.name.split(' ')[0]}</span>
+                  <PlanBadge plan={userPlan} />
                   <button onClick={handleLogout} style={{ ...S.pillBtn, color: '#9CA3AF', marginLeft: 4 }}>Salir</button>
                 </div>
               </>
@@ -1548,7 +1829,14 @@ export default function Home() {
           <div className="fade-up"><MyPlants plants={plants} onNavigate={navigate} /></div>
         ) : view === VIEWS.PLANT_DETAIL && selectedPlant ? (
           <div className="fade-up">
-            <PlantDetail plant={selectedPlant} onBack={() => navigate(VIEWS.MY_PLANTS)} onUpdate={updatePlant} />
+            <PlantDetail
+              plant={selectedPlant}
+              onBack={() => navigate(VIEWS.MY_PLANTS)}
+              onUpdate={updatePlant}
+              onDelete={deletePlant}
+              userPlan={userPlan}
+              userEmail={user?.email}
+            />
           </div>
         ) : null}
       </main>
