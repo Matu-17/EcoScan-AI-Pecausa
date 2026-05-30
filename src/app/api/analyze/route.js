@@ -27,18 +27,18 @@ export async function POST(request) {
               mimeType: 'image/jpeg'
             }
           },
-          `Analiza la comida de la imagen.
+          `Analiza la planta o cultivo de la imagen.
           Responde breve y directo.
-          Máximo 80 palabras.
+          Máximo 100 palabras.
 
           Formato:
-          🍽️ Alimentos:
-          - ingredientes visibles
+           Cultivo:
+          - Tipo de planta o cultivo aproximado
 
-          🔥 Calorías:
-          - total aproximado
+           Posibles enfermedades:
+          - Generar un aproximado y la gravedad
 
-          🥗 Opciones saludables:
+           Opciones en caso esté enferma:
           1.
           2.`
         ],
@@ -50,7 +50,7 @@ export async function POST(request) {
         console.warn('Cuota Pro agotada. Activando fallback con Gemini 2.5 Flash...');
         
         response = await ai.models.generateContent({
-          model: 'gemini-2.5-flash', // <--- Modelo secundario con cuota masiva gratuita
+          model: 'gemini-2.5-flash', 
           contents: [
             {
               inlineData: {
