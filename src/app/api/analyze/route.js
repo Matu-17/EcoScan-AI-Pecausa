@@ -1,98 +1,163 @@
 import { GoogleGenAI } from '@google/genai';
 import { NextResponse } from 'next/server';
 
-// Inicializa el cliente oficial de Google GenAI
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+const PLANT_IDENTIFICATION_PROMPT = `Eres un experto botánico. Analiza esta imagen de una planta y responde ÚNICAMENTE con un objeto JSON válido, sin markdown, sin backticks, sin texto adicional antes ni después.
+
+El JSON debe tener exactamente este formato:
+
+{
+  "recommended_species": {
+    "name": "Nombre común de la especie",
+    "scientific_name": "Nombre científico",
+    "confidence": 85
+  },
+  "alternatives": [
+    {
+      "name": "Segunda especie posible",
+      "confidence": 65
+    },
+    {
+      "name": "Tercera especie posible",
+      "confidence": 45
+    }
+  ],
+  "health_analysis": "Descripción del estado de salud visible de la planta en 1-2 oraciones.",
+  "watering_days": 5,
+  "fertilizer_days": 30,
+  "fertilizer_type": "NPK 10-10-10",
+  "sunlight": "Luz indirecta brillante",
+  "difficulty": "Fácil"
+}
+
+Reglas:
+- confidence es un número entero entre 0 y 100
+- watering_days es un número entero entre 1 y 30
+- fertilizer_days es un número entero entre 7 y 180
+- difficulty debe ser uno de: "Muy fácil", "Fácil", "Moderada", "Difícil", "Muy difícil"
+- Si no puedes identificar la planta con certeza, baja el confidence del recommended_species por debajo de 60
+- Responde SOLO el JSON. Nada más.`;
+
+const CHAT_SYSTEM_DEFAULT = `Eres un experto en botánica y cuidado de plantas. Responde de forma concisa, práctica y personalizada. Si no tienes información suficiente, pídela.`;
+
+async function callGemini(contents, modelName = 'gemini-2.5-flash') {
+  const response = await ai.models.generateContent({
+    model: modelName,
+    contents,
+  });
+  return response.text;
+}
+
+async function callGeminiWithFallback(contents) {
+  try {
+    return await callGemini(contents, 'gemini-2.5-flash');
+  } catch (err) {
+    const errStr = JSON.stringify(err);
+    if (errStr.includes('429') || errStr.includes('503')) {
+      console.warn('Primary model quota hit, trying fallback...');
+      return await callGemini(contents, 'gemini-1.5-flash');
+    }
+    throw err;
+  }
+}
 
 export async function POST(request) {
   try {
-    const { image } = await request.json();
+    const body = await request.json();
 
-    if (!image) {
-      return NextResponse.json({ error: 'No se recibió ninguna imagen' }, { status: 400 });
-    }
+    // ── PLANT IDENTIFICATION (image-based) ──────────────────────────────────
+    if (body.image) {
+      const base64Data = body.image.split(',')[1];
+      if (!base64Data) {
+        return NextResponse.json({ error: 'Imagen inválida' }, { status: 400 });
+      }
 
-    // Extrae solo los caracteres puros del Base64
-    const base64PureData = image.split(',')[1]; 
-
-    // Intentamos procesar primero con el modelo de alta precisión
-    let response;
-    try {
-      response = await ai.models.generateContent({
-        model: 'gemini-3.5-flash', 
-        contents: [
-          {
-            inlineData: {
-              data: base64PureData,
-              mimeType: 'image/jpeg'
-            }
+      const contents = [
+        {
+          inlineData: {
+            data: base64Data,
+            mimeType: 'image/jpeg',
           },
-          `Analiza la planta o cultivo de la imagen.
-          Responde breve y directo.
-          Máximo 100 palabras.
+        },
+        PLANT_IDENTIFICATION_PROMPT,
+      ];
 
-          Formato:
-           Cultivo:
-          - Tipo de planta o cultivo aproximado
+      let rawText = await callGeminiWithFallback(contents);
 
-           Posibles enfermedades:
-          - Generar un aproximado y la gravedad
+      // Strip any accidental markdown fences
+      rawText = rawText.replace(/```json|```/g, '').trim();
 
-           Opciones en caso esté enferma:
-          1.
-          2.`
-        ],
-      });
-    } catch (proError) {
-     
-      const errorStr = JSON.stringify(proError);
-      if (errorStr.includes('429')) {
-        console.warn('Cuota Pro agotada. Activando fallback con Gemini 2.5 Flash...');
-        
-        response = await ai.models.generateContent({
-          model: 'gemini-2.5-flash', 
-          contents: [
-            {
-              inlineData: {
-                data: base64PureData,
-                mimeType: 'image/jpeg'
-              }
-            },
-            `Analiza la comida de la imagen. Responde breve y directo...` 
-          ]
-        });
-      } else {
-        throw proError; 
+      // Validate it's real JSON
+      try {
+        const parsed = JSON.parse(rawText);
+        return NextResponse.json({ result: JSON.stringify(parsed) });
+      } catch {
+        // If JSON parse fails, return a low-confidence fallback
+        const fallback = {
+          recommended_species: {
+            name: 'Especie desconocida',
+            scientific_name: 'Unknown',
+            confidence: 0,
+          },
+          alternatives: [],
+          health_analysis: 'No se pudo analizar el estado de salud.',
+          watering_days: 7,
+          fertilizer_days: 30,
+          fertilizer_type: 'Fertilizante equilibrado',
+          sunlight: 'Luz indirecta',
+          difficulty: 'Moderada',
+        };
+        return NextResponse.json({ result: JSON.stringify(fallback) });
       }
     }
 
-    
-    if (!response.text) {
-      return NextResponse.json({ error: 'La IA no devolvió texto' }, { status: 500 });
+    // ── CHAT / TEXT ANALYSIS (no image) ────────────────────────────────────
+    if (body.message || body.prompt) {
+      const systemPrompt = body.systemPrompt || CHAT_SYSTEM_DEFAULT;
+      const userMessage = body.message || body.prompt;
+
+      const conversationContents = [];
+
+      // Include system context as first user turn if provided
+      if (body.systemPrompt) {
+        conversationContents.push(`[CONTEXTO DEL SISTEMA]\n${systemPrompt}\n\n[FIN CONTEXTO]`);
+      }
+
+      // Add prior chat history (last 6 turns)
+      if (body.chatHistory && body.chatHistory.length > 0) {
+        for (const msg of body.chatHistory.slice(-6)) {
+          conversationContents.push(`${msg.role === 'user' ? 'Usuario' : 'Asistente'}: ${msg.content}`);
+        }
+      }
+
+      conversationContents.push(`Usuario: ${userMessage}\nAsistente:`);
+
+      const text = await callGeminiWithFallback([conversationContents.join('\n\n')]);
+      return NextResponse.json({ result: text });
     }
 
-    return NextResponse.json({ result: response.text });
+    return NextResponse.json({ error: 'Solicitud inválida: se requiere imagen o mensaje' }, { status: 400 });
 
   } catch (error) {
-    console.error('Error detallado en tu servidor:', error);
-    const errorMessage = JSON.stringify(error);
+    console.error('Error en /api/analyze:', error);
+    const errStr = JSON.stringify(error);
 
-    if (errorMessage.includes('429')) {
+    if (errStr.includes('429')) {
       return NextResponse.json(
-        { error: '⚠️ NutriCam AI está saturado. Espera unos segundos e intenta de nuevo.' },
+        { error: '⚠️ La IA está saturada. Espera unos segundos e intenta de nuevo.' },
         { status: 429 }
       );
     }
-
-    if (errorMessage.includes('503')) {
+    if (errStr.includes('503')) {
       return NextResponse.json(
-        { error: '⚠️ Los servidores de Google están saturados. Reintenta en momentos.' },
+        { error: '⚠️ Los servidores de Google están saturados. Reintenta en breve.' },
         { status: 503 }
       );
     }
 
     return NextResponse.json(
-      { error: '❌ Ocurrió un error al procesar la imagen con NutriCam AI.' },
+      { error: '❌ Error al procesar la solicitud.' },
       { status: 500 }
     );
   }

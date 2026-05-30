@@ -50,25 +50,75 @@ function formatDate(dateStr) {
   return new Date(dateStr).toLocaleDateString('es-ES', { day: 'numeric', month: 'short', year: 'numeric' });
 }
 
+// Returns ms until next watering (can be negative if overdue)
+function msUntilNext(lastDateStr, intervalDays) {
+  if (!lastDateStr || !intervalDays) return null;
+  const next = new Date(lastDateStr).getTime() + intervalDays * 86400000;
+  return next - Date.now();
+}
+
+function formatCountdown(ms) {
+  if (ms === null) return null;
+  const abs = Math.abs(ms);
+  const days = Math.floor(abs / 86400000);
+  const hours = Math.floor((abs % 86400000) / 3600000);
+  const mins = Math.floor((abs % 3600000) / 60000);
+  return { days, hours, mins, overdue: ms < 0 };
+}
+
+function getWateringStatus(plant) {
+  const ms = msUntilNext(plant.lastWatered, plant.recommendedWateringDays || plant.waterInterval || 3);
+  if (ms === null) return 'unknown';
+  if (ms < 0) return 'overdue';
+  if (ms < 2 * 86400000) return 'soon';
+  return 'ok';
+}
+
+function getWateringStatusLabel(status) {
+  if (status === 'overdue') return 'Necesita riego';
+  if (status === 'soon') return 'Próximo riego cercano';
+  if (status === 'ok') return 'Todo correcto';
+  return 'Sin datos';
+}
+
+function getWateringStatusColor(status) {
+  if (status === 'overdue') return '#DC2626';
+  if (status === 'soon') return '#D97706';
+  return '#16A34A';
+}
+
 function getHealthStatus(plant) {
+  const status = getWateringStatus(plant);
+  if (status === 'overdue') return 'poor';
+  if (status === 'soon') return 'fair';
   const waterDays = daysBetween(plant.lastWatered);
-  const interval = plant.waterInterval || 3;
   if (waterDays === null) return 'fair';
-  if (waterDays > interval * 2) return 'poor';
-  if (waterDays > interval * 1.5) return 'fair';
-  if (waterDays <= interval) return 'excellent';
+  if (waterDays <= 1) return 'excellent';
   return 'good';
 }
 
 function getAlerts(plant) {
   const alerts = [];
-  const waterDays = daysBetween(plant.lastWatered);
-  const fertDays = daysBetween(plant.lastFertilized);
+  const interval = plant.recommendedWateringDays || plant.waterInterval || 3;
+  const fertInterval = plant.recommendedFertilizerDays || plant.fertInterval || 30;
+  const ms = msUntilNext(plant.lastWatered, interval);
+  const fertMs = msUntilNext(plant.lastFertilized, fertInterval);
   const photoDays = daysBetween(plant.lastPhotoDate);
-  if (waterDays !== null && waterDays >= (plant.waterInterval || 3)) alerts.push({ type: 'water', msg: 'Necesita agua pronto', icon: '💧', level: waterDays > (plant.waterInterval || 3) * 1.5 ? 'high' : 'medium' });
-  if (fertDays !== null && fertDays >= (plant.fertInterval || 30)) alerts.push({ type: 'fert', msg: 'Fertilización pendiente', icon: '🌿', level: 'medium' });
-  if (photoDays !== null && photoDays > 14) alerts.push({ type: 'photo', msg: 'Sin actualización reciente', icon: '📷', level: 'low' });
-  if (!waterDays && !plant.lastWatered) alerts.push({ type: 'water', msg: 'Registra tu primer riego', icon: '💧', level: 'low' });
+
+  if (ms === null) {
+    alerts.push({ type: 'water', msg: 'Registra tu primer riego', icon: '💧', level: 'low' });
+  } else if (ms < 0) {
+    alerts.push({ type: 'water', msg: 'Necesita agua', icon: '💧', level: 'high' });
+  } else if (ms < 2 * 86400000) {
+    alerts.push({ type: 'water', msg: 'Próximo riego cercano', icon: '💧', level: 'medium' });
+  }
+
+  if (fertMs !== null && fertMs < 0) {
+    alerts.push({ type: 'fert', msg: 'Fertilización pendiente', icon: '🌿', level: 'medium' });
+  }
+  if (photoDays !== null && photoDays > 14) {
+    alerts.push({ type: 'photo', msg: 'Sin actualización reciente', icon: '📷', level: 'low' });
+  }
   return alerts;
 }
 
@@ -84,6 +134,24 @@ function getAchievements(plant) {
   if (plant.registeredAt && daysBetween(plant.registeredAt) >= 30) achievements.push({ icon: '🏆', label: '1 mes juntos', unlocked: true });
   else achievements.push({ icon: '🏆', label: '1 mes juntos', unlocked: false, progress: daysBetween(plant.registeredAt) || 0, total: 30 });
   return achievements;
+}
+
+// ─── COUNTDOWN TIMER HOOK ─────────────────────────────────────────────────────
+
+function useCountdown(lastDateStr, intervalDays) {
+  const [countdown, setCountdown] = useState(null);
+
+  useEffect(() => {
+    const tick = () => {
+      const ms = msUntilNext(lastDateStr, intervalDays);
+      setCountdown(formatCountdown(ms));
+    };
+    tick();
+    const id = setInterval(tick, 60000);
+    return () => clearInterval(id);
+  }, [lastDateStr, intervalDays]);
+
+  return countdown;
 }
 
 // ─── AUTH MODAL ──────────────────────────────────────────────────────────────
@@ -129,16 +197,16 @@ function AuthModal({ mode, onClose, onSubmit, error }) {
 // ─── ADD PLANT FLOW ───────────────────────────────────────────────────────────
 
 function AddPlantFlow({ onClose, onSave, user }) {
-  const [step, setStep] = useState(1); // 1=upload, 2=species, 3=name, 4=care
+  const [step, setStep] = useState(1); // 1=upload, 2=species, 3=name
   const [image, setImage] = useState(null);
   const [loading, setLoading] = useState(false);
-  const [suggestedSpecies, setSuggestedSpecies] = useState([]);
+  const [aiResult, setAiResult] = useState(null); // parsed JSON from API
   const [selectedSpecies, setSelectedSpecies] = useState('');
+  const [customSpecies, setCustomSpecies] = useState('');
+  const [useCustom, setUseCustom] = useState(false);
   const [plantName, setPlantName] = useState('');
-  const [waterInterval, setWaterInterval] = useState(3);
-  const [fertInterval, setFertInterval] = useState(30);
   const [dragOver, setDragOver] = useState(false);
-  const [analysisResult, setAnalysisResult] = useState('');
+  const [lowConfidence, setLowConfidence] = useState(false);
 
   const handleImageChange = (e) => {
     const file = e.target.files[0];
@@ -157,59 +225,86 @@ function AddPlantFlow({ onClose, onSave, user }) {
     reader.readAsDataURL(file);
   };
 
-  const analyzeForSpecies = async () => {
+  const analyzeImage = async () => {
     if (!image) return;
     setLoading(true);
     try {
       const response = await fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          image,
-          prompt: `Identifica la planta en esta imagen. Responde SOLO con un JSON válido con este formato exacto:
-{"species": ["Nombre común 1 (nombre científico)", "Nombre común 2 (nombre científico)", "Nombre común 3 (nombre científico)"], "initial_analysis": "2-3 oraciones describiendo el estado visible de la planta"}
-No incluyas markdown, backticks ni texto adicional.`
-        }),
+        body: JSON.stringify({ image }),
       });
       const data = await response.json();
-      const text = (data.result || '').replace(/```json|```/g, '').trim();
+      let parsed = null;
       try {
-        const parsed = JSON.parse(text);
-        setSuggestedSpecies(parsed.species || []);
-        setAnalysisResult(parsed.initial_analysis || '');
-        if (parsed.species?.length > 0) setSelectedSpecies(parsed.species[0]);
+        const text = (data.result || '').replace(/```json|```/g, '').trim();
+        parsed = JSON.parse(text);
       } catch {
-        setSuggestedSpecies(['Especie no identificada']);
-        setSelectedSpecies('Especie no identificada');
+        parsed = {
+          recommended_species: { name: 'Especie desconocida', scientific_name: 'Unknown', confidence: 0 },
+          alternatives: [],
+          health_analysis: 'No se pudo analizar.',
+          watering_days: 7,
+          fertilizer_days: 30,
+          fertilizer_type: 'Fertilizante equilibrado',
+          sunlight: 'Luz indirecta',
+          difficulty: 'Moderada',
+        };
+      }
+      setAiResult(parsed);
+      const confidence = parsed.recommended_species?.confidence || 0;
+      setLowConfidence(confidence < 60);
+      if (confidence >= 60) {
+        setSelectedSpecies(parsed.recommended_species?.name || '');
       }
       setStep(2);
-    } catch { alert('Error al analizar la imagen'); }
-    finally { setLoading(false); }
+    } catch {
+      alert('Error al analizar la imagen. Intenta de nuevo.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const getEffectiveSpecies = () => {
+    if (useCustom) return customSpecies.trim() || 'Desconocida';
+    return selectedSpecies || 'Desconocida';
   };
 
   const savePlant = async () => {
     if (!plantName.trim()) return;
     const thumbnail = await createThumbnail(image);
     const now = new Date().toISOString();
+    const species = getEffectiveSpecies();
+    const isUnknown = species === 'Desconocida';
+
     const newPlant = {
       id: Date.now().toString(),
       name: plantName.trim(),
-      species: selectedSpecies,
+      species,
       thumbnail,
       mainImage: image,
       registeredAt: now,
       lastPhotoDate: now,
       lastWatered: null,
       lastFertilized: null,
-      waterInterval,
-      fertInterval,
       waterStreak: 0,
+      // AI-generated fields (only if plant was identified)
+      confidence: isUnknown ? null : (aiResult?.recommended_species?.confidence ?? null),
+      recommendedWateringDays: isUnknown ? null : (aiResult?.watering_days ?? null),
+      recommendedFertilizerDays: isUnknown ? null : (aiResult?.fertilizer_days ?? null),
+      fertilizerType: isUnknown ? null : (aiResult?.fertilizer_type ?? null),
+      sunlight: isUnknown ? null : (aiResult?.sunlight ?? null),
+      difficulty: isUnknown ? null : (aiResult?.difficulty ?? null),
+      // Activity log
+      activities: [],
       updates: [{
         id: Date.now(),
         date: now,
         image,
         thumbnail,
-        analysis: analysisResult || 'Planta recién registrada.',
+        analysis: isUnknown
+          ? 'Información insuficiente para generar cuidados automáticos.'
+          : (aiResult?.health_analysis || 'Planta recién registrada.'),
         type: 'initial',
       }],
       chatHistory: [],
@@ -218,7 +313,10 @@ No incluyas markdown, backticks ni texto adicional.`
     onSave(newPlant);
   };
 
-  const steps = ['Foto', 'Especie', 'Nombre', 'Cuidados'];
+  const steps = ['Foto', 'Especie', 'Nombre'];
+  const confidence = aiResult?.recommended_species?.confidence || 0;
+  const recommended = aiResult?.recommended_species;
+  const alternatives = aiResult?.alternatives || [];
 
   return (
     <div style={S.overlay}>
@@ -228,7 +326,7 @@ No incluyas markdown, backticks ni texto adicional.`
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 24 }}>
           <div>
             <h2 style={{ fontSize: 20, fontWeight: 700, color: '#111827', marginBottom: 4 }}>Agregar planta</h2>
-            <p style={{ fontSize: 13, color: '#9CA3AF' }}>Paso {step} de 4: {steps[step - 1]}</p>
+            <p style={{ fontSize: 13, color: '#9CA3AF' }}>Paso {step} de 3: {steps[step - 1]}</p>
           </div>
           <button onClick={onClose} style={S.closeBtn}>✕</button>
         </div>
@@ -243,7 +341,7 @@ No incluyas markdown, backticks ni texto adicional.`
         {/* Step 1: Upload */}
         {step === 1 && (
           <div>
-            <p style={{ fontSize: 14, color: '#6B7280', marginBottom: 16 }}>Sube una foto clara de tu planta para que la IA pueda identificarla.</p>
+            <p style={{ fontSize: 14, color: '#6B7280', marginBottom: 16 }}>Sube una foto clara de tu planta para que la IA la identifique automáticamente.</p>
             <div
               style={{ ...S.dropZone, ...(dragOver ? S.dropZoneActive : {}), minHeight: 220 }}
               onDragOver={e => { e.preventDefault(); setDragOver(true); }}
@@ -262,40 +360,192 @@ No incluyas markdown, backticks ni texto adicional.`
               <input type="file" accept="image/*" capture="environment" onChange={handleImageChange}
                 style={{ position: 'absolute', inset: 0, opacity: 0, cursor: 'pointer', width: '100%', height: '100%' }} />
             </div>
-            <button onClick={analyzeForSpecies} disabled={!image || loading} style={{ ...S.btnPrimary, marginTop: 16, width: '100%', opacity: (!image || loading) ? 0.5 : 1 }}>
-              {loading ? <span style={{ display: 'flex', alignItems: 'center', gap: 8, justifyContent: 'center' }}><span style={S.spinner} />Identificando especie...</span> : '🔍 Identificar planta'}
+            <button onClick={analyzeImage} disabled={!image || loading} style={{ ...S.btnPrimary, marginTop: 16, width: '100%', opacity: (!image || loading) ? 0.5 : 1 }}>
+              {loading
+                ? <span style={{ display: 'flex', alignItems: 'center', gap: 8, justifyContent: 'center' }}><span style={S.spinner} />Analizando imagen con IA...</span>
+                : '🔍 Identificar planta'}
             </button>
           </div>
         )}
 
-        {/* Step 2: Species */}
+        {/* Step 2: Species Selection */}
         {step === 2 && (
           <div>
-            {image && <img src={image} alt="" style={{ width: '100%', maxHeight: 160, objectFit: 'contain', borderRadius: 12, marginBottom: 16, backgroundColor: '#F9FAFB' }} />}
-            {analysisResult && <div style={{ backgroundColor: '#F0FDF4', border: '1px solid #BBF7D0', borderRadius: 10, padding: '10px 14px', fontSize: 13, color: '#15803D', marginBottom: 16 }}>{analysisResult}</div>}
-            <p style={{ fontSize: 14, color: '#6B7280', marginBottom: 12 }}>¿Cuál es tu planta?</p>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-              {suggestedSpecies.map(sp => (
-                <button key={sp} onClick={() => setSelectedSpecies(sp)} style={{
-                  padding: '12px 16px', borderRadius: 10, border: `2px solid ${selectedSpecies === sp ? '#16A34A' : '#E5E7EB'}`,
-                  backgroundColor: selectedSpecies === sp ? '#F0FDF4' : '#FFFFFF',
-                  color: selectedSpecies === sp ? '#15803D' : '#374151',
-                  fontWeight: selectedSpecies === sp ? 600 : 400, fontSize: 14,
-                  cursor: 'pointer', textAlign: 'left', transition: 'all 0.15s',
-                }}>
-                  {selectedSpecies === sp ? '✓ ' : ''}{sp}
+            {image && <img src={image} alt="" style={{ width: '100%', maxHeight: 140, objectFit: 'contain', borderRadius: 12, marginBottom: 16, backgroundColor: '#F9FAFB' }} />}
+
+            {/* Health analysis */}
+            {aiResult?.health_analysis && !lowConfidence && (
+              <div style={{ backgroundColor: '#F0FDF4', border: '1px solid #BBF7D0', borderRadius: 10, padding: '10px 14px', fontSize: 13, color: '#15803D', marginBottom: 16 }}>
+                🩺 {aiResult.health_analysis}
+              </div>
+            )}
+
+            {/* LOW CONFIDENCE warning */}
+            {lowConfidence ? (
+              <div>
+                <div style={{ backgroundColor: '#FFFBEB', border: '1px solid #FDE68A', borderRadius: 12, padding: '14px 16px', marginBottom: 16 }}>
+                  <p style={{ fontSize: 14, fontWeight: 700, color: '#92400E', marginBottom: 4 }}>⚠️ No pudimos identificar esta planta con suficiente precisión.</p>
+                  <p style={{ fontSize: 13, color: '#78350F' }}>Elige una de las opciones abajo o escribe el nombre manualmente.</p>
+                </div>
+
+                {/* Suggested alternatives */}
+                {alternatives.length > 0 && (
+                  <div style={{ marginBottom: 14 }}>
+                    <p style={{ fontSize: 12, fontWeight: 700, color: '#9CA3AF', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>Posibles especies</p>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                      {[...(recommended ? [{ name: recommended.name, confidence: recommended.confidence }] : []), ...alternatives].map(sp => (
+                        <button key={sp.name} onClick={() => { setSelectedSpecies(sp.name); setUseCustom(false); }} style={{
+                          padding: '11px 14px', borderRadius: 10,
+                          border: `2px solid ${selectedSpecies === sp.name && !useCustom ? '#16A34A' : '#E5E7EB'}`,
+                          backgroundColor: selectedSpecies === sp.name && !useCustom ? '#F0FDF4' : '#FFFFFF',
+                          color: selectedSpecies === sp.name && !useCustom ? '#15803D' : '#374151',
+                          fontWeight: selectedSpecies === sp.name && !useCustom ? 600 : 400,
+                          fontSize: 14, cursor: 'pointer', textAlign: 'left',
+                          display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                        }}>
+                          <span>{sp.name}</span>
+                          <span style={{ fontSize: 12, color: '#9CA3AF' }}>{sp.confidence}%</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Manual entry */}
+                <div style={{ marginBottom: 14 }}>
+                  <p style={{ fontSize: 12, fontWeight: 700, color: '#9CA3AF', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>Escribir manualmente</p>
+                  <input
+                    type="text"
+                    placeholder="Ej: Helecho de Boston, Cactus de Navidad..."
+                    value={customSpecies}
+                    onChange={e => { setCustomSpecies(e.target.value); setUseCustom(true); setSelectedSpecies(''); }}
+                    style={{ ...S.input, width: '100%' }}
+                  />
+                </div>
+
+                {/* Register as unknown */}
+                <button
+                  onClick={() => { setSelectedSpecies('Desconocida'); setUseCustom(false); setCustomSpecies(''); }}
+                  style={{
+                    width: '100%', padding: '11px 14px', borderRadius: 10, marginBottom: 4,
+                    border: `2px solid ${selectedSpecies === 'Desconocida' && !useCustom ? '#6B7280' : '#E5E7EB'}`,
+                    backgroundColor: selectedSpecies === 'Desconocida' && !useCustom ? '#F9FAFB' : '#FFFFFF',
+                    color: '#6B7280', fontSize: 14, cursor: 'pointer', textAlign: 'left',
+                  }}
+                >
+                  🔍 Registrar como "Desconocida" (identificar más tarde)
                 </button>
-              ))}
-              <button onClick={() => setSelectedSpecies('Otra especie')} style={{
-                padding: '12px 16px', borderRadius: 10, border: `2px solid ${selectedSpecies === 'Otra especie' ? '#16A34A' : '#E5E7EB'}`,
-                backgroundColor: '#FAFAFA', color: '#9CA3AF', fontSize: 14, cursor: 'pointer', textAlign: 'left',
-              }}>
-                + No está en la lista
-              </button>
-            </div>
+              </div>
+            ) : (
+              /* NORMAL FLOW: high confidence */
+              <div>
+                {/* Recommended */}
+                <div style={{ marginBottom: 16 }}>
+                  <p style={{ fontSize: 12, fontWeight: 700, color: '#9CA3AF', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>Planta recomendada</p>
+                  <button
+                    onClick={() => { setSelectedSpecies(recommended?.name || ''); setUseCustom(false); }}
+                    style={{
+                      width: '100%', padding: '14px 16px', borderRadius: 12,
+                      border: `2px solid ${selectedSpecies === recommended?.name && !useCustom ? '#16A34A' : '#E5E7EB'}`,
+                      backgroundColor: selectedSpecies === recommended?.name && !useCustom ? '#F0FDF4' : '#FFFFFF',
+                      color: selectedSpecies === recommended?.name && !useCustom ? '#15803D' : '#374151',
+                      cursor: 'pointer', textAlign: 'left',
+                      display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                    }}
+                  >
+                    <div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 2 }}>
+                        <span style={{ fontSize: 16 }}>✅</span>
+                        <span style={{ fontWeight: 700, fontSize: 15 }}>{recommended?.name}</span>
+                      </div>
+                      <p style={{ fontSize: 12, color: '#9CA3AF', marginLeft: 24 }}>{recommended?.scientific_name}</p>
+                    </div>
+                    <div style={{ textAlign: 'right', flexShrink: 0 }}>
+                      <div style={{ fontSize: 18, fontWeight: 800, color: '#16A34A' }}>{confidence}%</div>
+                      <div style={{ fontSize: 11, color: '#9CA3AF' }}>confianza</div>
+                    </div>
+                  </button>
+                </div>
+
+                {/* Alternatives */}
+                {alternatives.length > 0 && (
+                  <div style={{ marginBottom: 16 }}>
+                    <p style={{ fontSize: 12, fontWeight: 700, color: '#9CA3AF', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>Otras posibilidades</p>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                      {alternatives.map(alt => (
+                        <button key={alt.name} onClick={() => { setSelectedSpecies(alt.name); setUseCustom(false); }} style={{
+                          padding: '11px 14px', borderRadius: 10,
+                          border: `2px solid ${selectedSpecies === alt.name && !useCustom ? '#16A34A' : '#E5E7EB'}`,
+                          backgroundColor: selectedSpecies === alt.name && !useCustom ? '#F0FDF4' : '#FFFFFF',
+                          color: selectedSpecies === alt.name && !useCustom ? '#15803D' : '#374151',
+                          fontWeight: selectedSpecies === alt.name && !useCustom ? 600 : 400,
+                          fontSize: 14, cursor: 'pointer', textAlign: 'left',
+                          display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                        }}>
+                          <span>• {alt.name}</span>
+                          <span style={{ fontSize: 12, color: '#9CA3AF' }}>{alt.confidence}%</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Manual override */}
+                <button onClick={() => onClose()} style={{ display: 'none' }} />
+                <div>
+                  <p style={{ fontSize: 12, fontWeight: 700, color: '#9CA3AF', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>¿No es ninguna?</p>
+                  <input
+                    type="text"
+                    placeholder="Escribe el nombre manualmente..."
+                    value={customSpecies}
+                    onChange={e => { setCustomSpecies(e.target.value); setUseCustom(e.target.value.length > 0); if (e.target.value.length > 0) setSelectedSpecies(''); }}
+                    style={{ ...S.input, width: '100%' }}
+                  />
+                </div>
+              </div>
+            )}
+
+            {/* AI care summary (only if identified) */}
+            {!lowConfidence && aiResult && selectedSpecies && selectedSpecies !== 'Desconocida' && (
+              <div style={{ marginTop: 16, backgroundColor: '#F9FAFB', border: '1px solid #E5E7EB', borderRadius: 12, padding: '12px 14px' }}>
+                <p style={{ fontSize: 12, fontWeight: 700, color: '#374151', marginBottom: 8 }}>🤖 Cuidados generados por IA</p>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                  {[
+                    { icon: '💧', label: 'Riego', value: `Cada ${aiResult.watering_days} días` },
+                    { icon: '🌿', label: 'Fertilización', value: `Cada ${aiResult.fertilizer_days} días` },
+                    { icon: '☀️', label: 'Luz', value: aiResult.sunlight },
+                    { icon: '⭐', label: 'Dificultad', value: aiResult.difficulty },
+                  ].map(item => (
+                    <div key={item.label} style={{ fontSize: 12 }}>
+                      <span style={{ color: '#9CA3AF' }}>{item.icon} {item.label}: </span>
+                      <span style={{ fontWeight: 600, color: '#374151' }}>{item.value}</span>
+                    </div>
+                  ))}
+                </div>
+                {aiResult.fertilizer_type && (
+                  <div style={{ fontSize: 12, marginTop: 6 }}>
+                    <span style={{ color: '#9CA3AF' }}>🧪 Fertilizante: </span>
+                    <span style={{ fontWeight: 600, color: '#374151' }}>{aiResult.fertilizer_type}</span>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {selectedSpecies === 'Desconocida' && (
+              <div style={{ marginTop: 12, backgroundColor: '#F9FAFB', border: '1px solid #E5E7EB', borderRadius: 10, padding: '10px 14px', fontSize: 13, color: '#6B7280' }}>
+                ℹ️ Información insuficiente para generar cuidados automáticos. Podrás identificarla más tarde.
+              </div>
+            )}
+
             <div style={{ display: 'flex', gap: 10, marginTop: 20 }}>
               <button onClick={() => setStep(1)} style={{ ...S.btnOutline, flex: 1 }}>← Atrás</button>
-              <button onClick={() => setStep(3)} disabled={!selectedSpecies} style={{ ...S.btnPrimary, flex: 2, opacity: !selectedSpecies ? 0.5 : 1 }}>Continuar →</button>
+              <button
+                onClick={() => setStep(3)}
+                disabled={!getEffectiveSpecies()}
+                style={{ ...S.btnPrimary, flex: 2, opacity: !getEffectiveSpecies() ? 0.5 : 1 }}
+              >
+                Continuar →
+              </button>
             </div>
           </div>
         )}
@@ -308,7 +558,10 @@ No incluyas markdown, backticks ni texto adicional.`
               {image && <img src={image} alt="" style={{ width: 64, height: 64, borderRadius: 10, objectFit: 'cover' }} />}
               <div>
                 <p style={{ fontSize: 12, color: '#9CA3AF', marginBottom: 2 }}>Especie</p>
-                <p style={{ fontSize: 14, fontWeight: 600, color: '#111827' }}>{selectedSpecies}</p>
+                <p style={{ fontSize: 14, fontWeight: 600, color: '#111827' }}>{getEffectiveSpecies()}</p>
+                {!lowConfidence && aiResult && confidence >= 60 && (
+                  <p style={{ fontSize: 12, color: '#16A34A', marginTop: 2 }}>✓ Identificada con {confidence}% de confianza</p>
+                )}
               </div>
             </div>
             <div style={S.fieldGroup}>
@@ -316,57 +569,68 @@ No incluyas markdown, backticks ni texto adicional.`
               <input type="text" placeholder='Ej: "Mi Monstera", "Plantita del balcón"'
                 value={plantName} onChange={e => setPlantName(e.target.value)}
                 style={{ ...S.input, fontSize: 16, padding: '12px 16px' }}
-                onKeyDown={e => e.key === 'Enter' && plantName.trim() && setStep(4)}
+                onKeyDown={e => e.key === 'Enter' && plantName.trim() && savePlant()}
               />
             </div>
-            <div style={{ display: 'flex', gap: 10, marginTop: 20 }}>
-              <button onClick={() => setStep(2)} style={{ ...S.btnOutline, flex: 1 }}>← Atrás</button>
-              <button onClick={() => setStep(4)} disabled={!plantName.trim()} style={{ ...S.btnPrimary, flex: 2, opacity: !plantName.trim() ? 0.5 : 1 }}>Continuar →</button>
-            </div>
-          </div>
-        )}
-
-        {/* Step 4: Care schedule */}
-        {step === 4 && (
-          <div>
-            <p style={{ fontSize: 14, color: '#6B7280', marginBottom: 20 }}>Configura la frecuencia de cuidados para recibir alertas.</p>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-              <div style={{ padding: 16, backgroundColor: '#EFF6FF', borderRadius: 12, border: '1px solid #DBEAFE' }}>
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                    <span style={{ fontSize: 18 }}>💧</span>
-                    <span style={{ fontSize: 14, fontWeight: 600, color: '#1E40AF' }}>Riego</span>
-                  </div>
-                  <span style={{ fontSize: 14, fontWeight: 700, color: '#1E40AF' }}>cada {waterInterval} día{waterInterval > 1 ? 's' : ''}</span>
-                </div>
-                <input type="range" min={1} max={14} value={waterInterval} onChange={e => setWaterInterval(Number(e.target.value))}
-                  style={{ width: '100%' }} />
-                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: '#93C5FD', marginTop: 4 }}>
-                  <span>1 día</span><span>7 días</span><span>14 días</span>
-                </div>
-              </div>
-              <div style={{ padding: 16, backgroundColor: '#F0FDF4', borderRadius: 12, border: '1px solid #BBF7D0' }}>
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                    <span style={{ fontSize: 18 }}>🌿</span>
-                    <span style={{ fontSize: 14, fontWeight: 600, color: '#15803D' }}>Fertilización</span>
-                  </div>
-                  <span style={{ fontSize: 14, fontWeight: 700, color: '#15803D' }}>cada {fertInterval} días</span>
-                </div>
-                <input type="range" min={7} max={90} step={7} value={fertInterval} onChange={e => setFertInterval(Number(e.target.value))}
-                  style={{ width: '100%' }} />
-                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: '#86EFAC', marginTop: 4 }}>
-                  <span>1 sem</span><span>1 mes</span><span>3 meses</span>
-                </div>
-              </div>
-            </div>
             <div style={{ display: 'flex', gap: 10, marginTop: 24 }}>
-              <button onClick={() => setStep(3)} style={{ ...S.btnOutline, flex: 1 }}>← Atrás</button>
-              <button onClick={savePlant} style={{ ...S.btnPrimary, flex: 2 }}>🌱 Registrar planta</button>
+              <button onClick={() => setStep(2)} style={{ ...S.btnOutline, flex: 1 }}>← Atrás</button>
+              <button onClick={savePlant} disabled={!plantName.trim()} style={{ ...S.btnPrimary, flex: 2, opacity: !plantName.trim() ? 0.5 : 1 }}>
+                🌱 Registrar planta
+              </button>
             </div>
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+// ─── WATERING COUNTDOWN WIDGET ────────────────────────────────────────────────
+
+function WateringCountdown({ plant, style }) {
+  const interval = plant.recommendedWateringDays || plant.waterInterval || 3;
+  const countdown = useCountdown(plant.lastWatered, interval);
+  const status = getWateringStatus(plant);
+  const statusColor = getWateringStatusColor(status);
+  const statusLabel = getWateringStatusLabel(status);
+
+  if (!plant.lastWatered) {
+    return (
+      <div style={{ backgroundColor: '#F9FAFB', border: '1px solid #E5E7EB', borderRadius: 14, padding: '14px 16px', ...style }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+          <span style={{ fontSize: 18 }}>💧</span>
+          <span style={{ fontSize: 13, fontWeight: 700, color: '#374151' }}>Próximo riego</span>
+        </div>
+        <p style={{ fontSize: 13, color: '#9CA3AF' }}>Registra el primer riego para activar el temporizador.</p>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ backgroundColor: status === 'overdue' ? '#FEF2F2' : status === 'soon' ? '#FFFBEB' : '#F0FDF4', border: `1px solid ${status === 'overdue' ? '#FECACA' : status === 'soon' ? '#FDE68A' : '#BBF7D0'}`, borderRadius: 14, padding: '14px 16px', ...style }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ fontSize: 18 }}>💧</span>
+          <span style={{ fontSize: 13, fontWeight: 700, color: '#374151' }}>Próximo riego</span>
+        </div>
+        <span style={{ fontSize: 11, fontWeight: 700, color: statusColor, backgroundColor: status === 'overdue' ? '#FEE2E2' : status === 'soon' ? '#FEF3C7' : '#DCFCE7', padding: '3px 10px', borderRadius: 20 }}>
+          {status === 'overdue' ? '🔴' : status === 'soon' ? '🟡' : '🟢'} {statusLabel}
+        </span>
+      </div>
+      {countdown && (
+        <div style={{ display: 'flex', gap: 8 }}>
+          {[
+            { v: countdown.days, u: 'días' },
+            { v: countdown.hours, u: 'horas' },
+            { v: countdown.mins, u: 'min' },
+          ].map(({ v, u }) => (
+            <div key={u} style={{ flex: 1, textAlign: 'center', backgroundColor: 'rgba(255,255,255,0.7)', borderRadius: 10, padding: '8px 4px' }}>
+              <div style={{ fontSize: 22, fontWeight: 800, color: statusColor }}>{countdown.overdue ? '-' : ''}{v}</div>
+              <div style={{ fontSize: 10, color: '#9CA3AF' }}>{u}</div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -376,6 +640,8 @@ No incluyas markdown, backticks ni texto adicional.`
 function PlantCard({ plant, onClick }) {
   const health = getHealthStatus(plant);
   const alerts = getAlerts(plant);
+  const status = getWateringStatus(plant);
+  const statusColor = getWateringStatusColor(status);
   const waterDays = daysBetween(plant.lastWatered);
 
   return (
@@ -392,6 +658,8 @@ function PlantCard({ plant, onClick }) {
             {alerts.length}
           </div>
         )}
+        {/* Watering status dot */}
+        <div style={{ position: 'absolute', top: 10, left: 10, width: 10, height: 10, borderRadius: '50%', backgroundColor: statusColor, border: '2px solid white' }} />
       </div>
       <div style={{ padding: '14px 16px' }}>
         <p style={{ fontSize: 16, fontWeight: 700, color: '#111827', marginBottom: 2 }}>{plant.name}</p>
@@ -402,7 +670,7 @@ function PlantCard({ plant, onClick }) {
             <span style={{ fontSize: 12, fontWeight: 600, color: HEALTH_COLORS[health] }}>{HEALTH_LABELS[health]}</span>
           </div>
           <span style={{ fontSize: 12, color: '#9CA3AF' }}>
-            {waterDays === null ? 'Sin riego registrado' : waterDays === 0 ? 'Regada hoy' : `Hace ${waterDays}d`}
+            {waterDays === null ? 'Sin riego' : waterDays === 0 ? 'Regada hoy' : `Hace ${waterDays}d`}
           </span>
         </div>
         <div style={{ marginTop: 10, height: 4, backgroundColor: '#E5E7EB', borderRadius: 2, overflow: 'hidden' }}>
@@ -418,7 +686,6 @@ function PlantCard({ plant, onClick }) {
 function PlantDetail({ plant: initialPlant, onBack, onUpdate }) {
   const [plant, setPlant] = useState(initialPlant);
   const [activeTab, setActiveTab] = useState('overview');
-  const [uploading, setUploading] = useState(false);
   const [chatInput, setChatInput] = useState('');
   const [chatLoading, setChatLoading] = useState(false);
   const [newPhoto, setNewPhoto] = useState(null);
@@ -433,13 +700,22 @@ function PlantDetail({ plant: initialPlant, onBack, onUpdate }) {
     onUpdate(updated);
   };
 
+  const logActivity = (type) => {
+    const entry = { id: Date.now(), type, date: new Date().toISOString() };
+    return [...(plant.activities || []), entry];
+  };
+
   const markWatered = () => {
     const now = new Date().toISOString();
     const streak = (plant.waterStreak || 0) + 1;
-    update({ lastWatered: now, waterStreak: streak });
+    const activities = logActivity('watering');
+    update({ lastWatered: now, waterStreak: streak, activities });
   };
 
-  const markFertilized = () => update({ lastFertilized: new Date().toISOString() });
+  const markFertilized = () => {
+    const activities = logActivity('fertilization');
+    update({ lastFertilized: new Date().toISOString(), activities });
+  };
 
   const handleNewPhoto = (e) => {
     const file = e.target.files[0];
@@ -499,12 +775,12 @@ Responde en español de forma clara y directa.`,
 - Registrada: ${formatDate(plant.registeredAt)}
 - Último riego: ${plant.lastWatered ? formatDate(plant.lastWatered) + ` (hace ${daysBetween(plant.lastWatered)} días)` : 'No registrado'}
 - Última fertilización: ${plant.lastFertilized ? formatDate(plant.lastFertilized) : 'No registrada'}
-- Frecuencia de riego configurada: cada ${plant.waterInterval} días
-- Última foto: ${plant.lastPhotoDate ? formatDate(plant.lastPhotoDate) : 'No disponible'}
-- Número de actualizaciones registradas: ${(plant.updates || []).length}
+- Frecuencia de riego recomendada: cada ${plant.recommendedWateringDays || plant.waterInterval || 3} días
+- Fertilizante recomendado: ${plant.fertilizerType || 'No especificado'}
+- Luz recomendada: ${plant.sunlight || 'No especificada'}
 ${plant.updates?.[0]?.analysis ? `- Último análisis: "${plant.updates[0].analysis}"` : ''}
 
-Responde de forma concisa, práctica y personalizada para esta planta específica. Si no tienes información suficiente, pídela.`;
+Responde de forma concisa, práctica y personalizada para esta planta específica.`;
       const response = await fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -526,11 +802,18 @@ Responde de forma concisa, práctica y personalizada para esta planta específic
   const achievements = getAchievements(plant);
   const waterDays = daysBetween(plant.lastWatered);
   const fertDays = daysBetween(plant.lastFertilized);
-  const tabs = [{ id: 'overview', label: '📊 Resumen' }, { id: 'care', label: '💧 Cuidados' }, { id: 'updates', label: '📸 Historial' }, { id: 'ai', label: '🤖 IA' }];
+  const waterInterval = plant.recommendedWateringDays || plant.waterInterval || 3;
+  const fertInterval = plant.recommendedFertilizerDays || plant.fertInterval || 30;
+  const tabs = [
+    { id: 'overview', label: '📊 Resumen' },
+    { id: 'care', label: '💧 Cuidados' },
+    { id: 'ai_info', label: '🤖 Info IA' },
+    { id: 'updates', label: '📸 Historial' },
+    { id: 'ai', label: '💬 Asistente' },
+  ];
 
   return (
     <div style={{ maxWidth: 800, margin: '0 auto', padding: '24px 16px' }}>
-      {/* Back + header */}
       <button onClick={onBack} style={{ ...S.btnOutline, marginBottom: 20, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
         ← Mis Plantas
       </button>
@@ -556,6 +839,11 @@ Responde de forma concisa, práctica y personalizada para esta planta específic
                 🔥 Racha {plant.waterStreak} riegos
               </div>
             )}
+            {plant.difficulty && (
+              <div style={{ backgroundColor: '#FEF9C3', border: '1px solid #FDE68A', borderRadius: 20, padding: '4px 12px', fontSize: 12, fontWeight: 600, color: '#92400E' }}>
+                ⭐ {plant.difficulty}
+              </div>
+            )}
           </div>
         </div>
       </div>
@@ -565,8 +853,7 @@ Responde de forma concisa, práctica y personalizada para esta planta específic
         <div style={{ marginBottom: 20, display: 'flex', flexDirection: 'column', gap: 8 }}>
           {alerts.map((a, i) => (
             <div key={i} style={{
-              display: 'flex', alignItems: 'center', gap: 10,
-              padding: '10px 16px', borderRadius: 10,
+              display: 'flex', alignItems: 'center', gap: 10, padding: '10px 16px', borderRadius: 10,
               backgroundColor: a.level === 'high' ? '#FEF2F2' : a.level === 'medium' ? '#FFFBEB' : '#F9FAFB',
               border: `1px solid ${a.level === 'high' ? '#FECACA' : a.level === 'medium' ? '#FDE68A' : '#E5E7EB'}`,
             }}>
@@ -585,7 +872,7 @@ Responde de forma concisa, práctica y personalizada para esta planta específic
             backgroundColor: activeTab === t.id ? '#FFFFFF' : 'transparent',
             color: activeTab === t.id ? '#111827' : '#9CA3AF',
             fontWeight: activeTab === t.id ? 700 : 400,
-            fontSize: 13, whiteSpace: 'nowrap',
+            fontSize: 12, whiteSpace: 'nowrap',
             boxShadow: activeTab === t.id ? '0 1px 4px rgba(0,0,0,0.08)' : 'none',
             transition: 'all 0.15s',
           }}>
@@ -597,6 +884,9 @@ Responde de forma concisa, práctica y personalizada para esta planta específic
       {/* TAB: Overview */}
       {activeTab === 'overview' && (
         <div>
+          {/* Countdown */}
+          <WateringCountdown plant={plant} style={{ marginBottom: 16 }} />
+
           {/* Stats grid */}
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 12, marginBottom: 24 }}>
             {[
@@ -654,13 +944,17 @@ Responde de forma concisa, práctica y personalizada para esta planta específic
               <span style={{ fontSize: 24 }}>💧</span>
               <div style={{ flex: 1 }}>
                 <p style={{ fontWeight: 700, color: '#1E40AF', marginBottom: 2 }}>Riego</p>
-                <p style={{ fontSize: 12, color: '#93C5FD' }}>Cada {plant.waterInterval} día{plant.waterInterval > 1 ? 's' : ''}</p>
+                <p style={{ fontSize: 12, color: '#93C5FD' }}>
+                  Cada {waterInterval} día{waterInterval > 1 ? 's' : ''}
+                  {plant.recommendedWateringDays && <span style={{ marginLeft: 6, backgroundColor: '#DBEAFE', color: '#1E40AF', fontSize: 10, fontWeight: 700, padding: '2px 6px', borderRadius: 10 }}>IA</span>}
+                </p>
               </div>
-              {waterDays !== null && waterDays >= (plant.waterInterval || 3) && (
+              {getWateringStatus(plant) === 'overdue' && (
                 <div style={{ backgroundColor: '#EF4444', color: '#fff', borderRadius: 20, padding: '3px 10px', fontSize: 11, fontWeight: 700 }}>¡Necesita agua!</div>
               )}
             </div>
             <div style={{ padding: '14px 18px' }}>
+              <WateringCountdown plant={plant} style={{ marginBottom: 14 }} />
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 14 }}>
                 <div>
                   <p style={{ fontSize: 11, color: '#9CA3AF', marginBottom: 2 }}>Último riego</p>
@@ -668,11 +962,11 @@ Responde de forma concisa, práctica y personalizada para esta planta específic
                 </div>
                 <div>
                   <p style={{ fontSize: 11, color: '#9CA3AF', marginBottom: 2 }}>Próximo riego</p>
-                  <p style={{ fontSize: 15, fontWeight: 600, color: '#111827' }}>{plant.lastWatered ? nextDate(plant.lastWatered, plant.waterInterval || 3) : '—'}</p>
+                  <p style={{ fontSize: 15, fontWeight: 600, color: '#111827' }}>{plant.lastWatered ? nextDate(plant.lastWatered, waterInterval) : '—'}</p>
                 </div>
               </div>
               <button onClick={markWatered} style={{ ...S.btnPrimary, width: '100%', backgroundColor: '#1D4ED8' }}>
-                💧 Ya regué — {new Date().toLocaleDateString('es-ES', { day: 'numeric', month: 'short' })}
+                💧 Regar ahora — {new Date().toLocaleDateString('es-ES', { day: 'numeric', month: 'short' })}
               </button>
             </div>
           </div>
@@ -683,10 +977,18 @@ Responde de forma concisa, práctica y personalizada para esta planta específic
               <span style={{ fontSize: 24 }}>🌿</span>
               <div style={{ flex: 1 }}>
                 <p style={{ fontWeight: 700, color: '#15803D', marginBottom: 2 }}>Fertilización</p>
-                <p style={{ fontSize: 12, color: '#86EFAC' }}>Cada {plant.fertInterval} días</p>
+                <p style={{ fontSize: 12, color: '#86EFAC' }}>
+                  Cada {fertInterval} días
+                  {plant.recommendedFertilizerDays && <span style={{ marginLeft: 6, backgroundColor: '#DCFCE7', color: '#15803D', fontSize: 10, fontWeight: 700, padding: '2px 6px', borderRadius: 10 }}>IA</span>}
+                </p>
               </div>
             </div>
             <div style={{ padding: '14px 18px' }}>
+              {plant.fertilizerType && (
+                <div style={{ backgroundColor: '#F0FDF4', borderRadius: 8, padding: '8px 12px', marginBottom: 12, fontSize: 13 }}>
+                  🧪 Fertilizante recomendado: <strong>{plant.fertilizerType}</strong>
+                </div>
+              )}
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 14 }}>
                 <div>
                   <p style={{ fontSize: 11, color: '#9CA3AF', marginBottom: 2 }}>Última fertilización</p>
@@ -694,11 +996,11 @@ Responde de forma concisa, práctica y personalizada para esta planta específic
                 </div>
                 <div>
                   <p style={{ fontSize: 11, color: '#9CA3AF', marginBottom: 2 }}>Próxima</p>
-                  <p style={{ fontSize: 15, fontWeight: 600, color: '#111827' }}>{plant.lastFertilized ? nextDate(plant.lastFertilized, plant.fertInterval || 30) : '—'}</p>
+                  <p style={{ fontSize: 15, fontWeight: 600, color: '#111827' }}>{plant.lastFertilized ? nextDate(plant.lastFertilized, fertInterval) : '—'}</p>
                 </div>
               </div>
               <button onClick={markFertilized} style={{ ...S.btnPrimary, width: '100%' }}>
-                🌿 Ya fertilicé
+                🌿 Fertilizar ahora
               </button>
             </div>
           </div>
@@ -727,16 +1029,99 @@ Responde de forma concisa, práctica y personalizada para esta planta específic
         </div>
       )}
 
-      {/* TAB: Updates history */}
-      {activeTab === 'updates' && (
+      {/* TAB: AI Info */}
+      {activeTab === 'ai_info' && (
         <div>
+          {plant.species === 'Desconocida' || !plant.confidence ? (
+            <div style={{ backgroundColor: '#FFFBEB', border: '1px solid #FDE68A', borderRadius: 14, padding: '20px 18px', textAlign: 'center' }}>
+              <div style={{ fontSize: 36, marginBottom: 12 }}>🔍</div>
+              <h3 style={{ fontSize: 16, fontWeight: 700, color: '#92400E', marginBottom: 8 }}>Información insuficiente</h3>
+              <p style={{ fontSize: 14, color: '#78350F', marginBottom: 16 }}>
+                Esta planta no fue identificada con suficiente confianza. Sube una nueva foto desde la pestaña Cuidados para intentar identificarla.
+              </p>
+            </div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+              <div style={{ backgroundColor: '#F0FDF4', border: '1px solid #BBF7D0', borderRadius: 14, padding: '16px 18px' }}>
+                <p style={{ fontSize: 12, fontWeight: 700, color: '#15803D', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 14 }}>Información IA</p>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 14 }}>
+                  {[
+                    { icon: '🌱', label: 'Especie identificada', value: plant.species },
+                    { icon: '📊', label: 'Confianza de identificación', value: plant.confidence ? `${plant.confidence}%` : '—' },
+                    { icon: '☀️', label: 'Luz recomendada', value: plant.sunlight || '—' },
+                    { icon: '💧', label: 'Frecuencia de riego', value: plant.recommendedWateringDays ? `Cada ${plant.recommendedWateringDays} días` : '—' },
+                    { icon: '🌿', label: 'Frecuencia de fertilización', value: plant.recommendedFertilizerDays ? `Cada ${plant.recommendedFertilizerDays} días` : '—' },
+                    { icon: '🧪', label: 'Fertilizante recomendado', value: plant.fertilizerType || '—' },
+                    { icon: '⭐', label: 'Dificultad de cuidado', value: plant.difficulty || '—' },
+                  ].map(item => (
+                    <div key={item.label} style={{ display: 'flex', gap: 12, alignItems: 'flex-start' }}>
+                      <span style={{ fontSize: 20, flexShrink: 0, marginTop: 2 }}>{item.icon}</span>
+                      <div>
+                        <p style={{ fontSize: 11, color: '#9CA3AF', marginBottom: 2 }}>{item.label}</p>
+                        <p style={{ fontSize: 14, fontWeight: 600, color: '#111827' }}>{item.value}</p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Health state */}
+              {plant.updates?.[0]?.analysis && (
+                <div style={{ backgroundColor: '#F9FAFB', border: '1px solid #E5E7EB', borderRadius: 14, padding: '16px 18px' }}>
+                  <p style={{ fontSize: 12, fontWeight: 700, color: '#374151', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>Estado actual</p>
+                  <p style={{ fontSize: 14, color: '#374151', lineHeight: 1.7 }}>{plant.updates[0].analysis}</p>
+                </div>
+              )}
+
+              {/* Confidence bar */}
+              {plant.confidence && (
+                <div style={{ backgroundColor: '#F9FAFB', border: '1px solid #E5E7EB', borderRadius: 14, padding: '16px 18px' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
+                    <span style={{ fontSize: 13, fontWeight: 700, color: '#374151' }}>Confianza de identificación</span>
+                    <span style={{ fontSize: 13, fontWeight: 800, color: plant.confidence >= 80 ? '#16A34A' : plant.confidence >= 60 ? '#D97706' : '#DC2626' }}>{plant.confidence}%</span>
+                  </div>
+                  <div style={{ height: 8, backgroundColor: '#E5E7EB', borderRadius: 4, overflow: 'hidden' }}>
+                    <div style={{ height: '100%', borderRadius: 4, backgroundColor: plant.confidence >= 80 ? '#16A34A' : plant.confidence >= 60 ? '#D97706' : '#DC2626', width: `${plant.confidence}%`, transition: 'width 0.8s' }} />
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* TAB: Activity History */}
+      {activeTab === 'updates' && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+          {/* Activity log */}
+          {plant.activities && plant.activities.length > 0 && (
+            <div style={{ border: '1px solid #E5E7EB', borderRadius: 14, padding: '16px 18px' }}>
+              <p style={{ fontSize: 14, fontWeight: 700, color: '#111827', marginBottom: 14 }}>📋 Actividades registradas</p>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                {[...plant.activities].reverse().map((act) => (
+                  <div key={act.id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '8px 12px', backgroundColor: act.type === 'watering' ? '#EFF6FF' : '#F0FDF4', borderRadius: 10, border: `1px solid ${act.type === 'watering' ? '#DBEAFE' : '#BBF7D0'}` }}>
+                    <span style={{ fontSize: 18 }}>{act.type === 'watering' ? '💧' : '🌿'}</span>
+                    <div style={{ flex: 1 }}>
+                      <p style={{ fontSize: 13, fontWeight: 600, color: act.type === 'watering' ? '#1E40AF' : '#15803D' }}>
+                        {act.type === 'watering' ? 'Riego' : 'Fertilización'}
+                      </p>
+                      <p style={{ fontSize: 11, color: '#9CA3AF' }}>{formatDate(act.date)}</p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Photo updates */}
           {(!plant.updates || plant.updates.length === 0) ? (
             <div style={{ textAlign: 'center', padding: '48px 24px', color: '#9CA3AF' }}>
               <div style={{ fontSize: 40, marginBottom: 12 }}>📭</div>
               <p>Aún no hay actualizaciones registradas.</p>
             </div>
           ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+            <>
+              <p style={{ fontSize: 14, fontWeight: 700, color: '#111827' }}>📸 Fotos y análisis</p>
               {plant.updates.map((u, i) => (
                 <div key={u.id} style={{ border: '1px solid #E5E7EB', borderRadius: 14, overflow: 'hidden' }}>
                   <div style={{ display: 'flex', gap: 14, padding: 14 }}>
@@ -753,7 +1138,7 @@ Responde de forma concisa, práctica y personalizada para esta planta específic
                   </div>
                 </div>
               ))}
-            </div>
+            </>
           )}
         </div>
       )}
@@ -820,10 +1205,23 @@ Responde de forma concisa, práctica y personalizada para esta planta específic
 
 function Dashboard({ plants, onNavigate }) {
   const needsAttention = plants.filter(p => getAlerts(p).some(a => a.level !== 'low'));
-  const needsWater = plants.filter(p => {
-    const d = daysBetween(p.lastWatered);
-    return d === null || d >= (p.waterInterval || 3);
+  const needsWater = plants.filter(p => getWateringStatus(p) === 'overdue');
+  const needsWaterSoon = plants.filter(p => getWateringStatus(p) === 'soon');
+  const needsFert = plants.filter(p => {
+    const fertInterval = p.recommendedFertilizerDays || p.fertInterval || 30;
+    const ms = msUntilNext(p.lastFertilized, fertInterval);
+    return ms !== null && ms < 0;
   });
+  const healthy = plants.filter(p => getHealthStatus(p) === 'excellent' || getHealthStatus(p) === 'good');
+
+  // Next upcoming watering
+  const nextWateringPlant = plants
+    .map(p => {
+      const ms = msUntilNext(p.lastWatered, p.recommendedWateringDays || p.waterInterval || 3);
+      return { plant: p, ms };
+    })
+    .filter(x => x.ms !== null && x.ms > 0)
+    .sort((a, b) => a.ms - b.ms)[0];
 
   return (
     <div style={{ maxWidth: 900, margin: '0 auto', padding: '32px 16px' }}>
@@ -833,16 +1231,17 @@ function Dashboard({ plants, onNavigate }) {
       </div>
 
       {/* Stats */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 14, marginBottom: 32 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 14, marginBottom: 32 }}>
         {[
-          { icon: '🌱', value: plants.length, label: 'Plantas registradas', color: '#16A34A', bg: '#F0FDF4' },
-          { icon: '⚠️', value: needsAttention.length, label: 'Necesitan atención', color: '#D97706', bg: '#FFFBEB' },
-          { icon: '💧', value: needsWater.length, label: 'Necesitan agua', color: '#1D4ED8', bg: '#EFF6FF' },
-          { icon: '✅', value: plants.length - needsAttention.length, label: 'En buen estado', color: '#16A34A', bg: '#F0FDF4' },
+          { icon: '🌱', value: plants.length, label: 'Total plantas', color: '#16A34A', bg: '#F0FDF4', border: '#BBF7D0' },
+          { icon: '💧', value: needsWater.length, label: 'Necesitan riego hoy', color: '#1D4ED8', bg: '#EFF6FF', border: '#DBEAFE' },
+          { icon: '🌿', value: needsFert.length, label: 'Necesitan fertilizante', color: '#15803D', bg: '#F0FDF4', border: '#BBF7D0' },
+          { icon: '✅', value: healthy.length, label: 'Plantas saludables', color: '#16A34A', bg: '#F0FDF4', border: '#BBF7D0' },
+          { icon: '⏰', value: nextWateringPlant ? nextWateringPlant.plant.name : '—', label: 'Próximo riego', color: '#D97706', bg: '#FFFBEB', border: '#FDE68A' },
         ].map(s => (
-          <div key={s.label} style={{ backgroundColor: s.bg, borderRadius: 16, padding: '18px 20px', border: `1px solid ${s.bg === '#F0FDF4' ? '#BBF7D0' : s.bg === '#FFFBEB' ? '#FDE68A' : s.bg === '#EFF6FF' ? '#DBEAFE' : '#BBF7D0'}` }}>
-            <div style={{ fontSize: 28, marginBottom: 8 }}>{s.icon}</div>
-            <div style={{ fontSize: 28, fontWeight: 800, color: s.color, marginBottom: 2 }}>{s.value}</div>
+          <div key={s.label} style={{ backgroundColor: s.bg, borderRadius: 16, padding: '18px 16px', border: `1px solid ${s.border}` }}>
+            <div style={{ fontSize: 26, marginBottom: 8 }}>{s.icon}</div>
+            <div style={{ fontSize: typeof s.value === 'number' ? 28 : 14, fontWeight: 800, color: s.color, marginBottom: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.value}</div>
             <div style={{ fontSize: 12, color: '#9CA3AF' }}>{s.label}</div>
           </div>
         ))}
@@ -857,24 +1256,40 @@ function Dashboard({ plants, onNavigate }) {
         </div>
       ) : (
         <>
-          {/* Needs attention */}
-          {needsAttention.length > 0 && (
-            <div style={{ marginBottom: 32 }}>
-              <h2 style={{ fontSize: 18, fontWeight: 700, color: '#111827', marginBottom: 14 }}>⚠️ Requieren atención</h2>
+          {/* Needs water now */}
+          {needsWater.length > 0 && (
+            <div style={{ marginBottom: 28 }}>
+              <h2 style={{ fontSize: 18, fontWeight: 700, color: '#111827', marginBottom: 14 }}>💧 Necesitan riego ahora</h2>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-                {needsAttention.slice(0, 3).map(p => {
-                  const alerts = getAlerts(p);
-                  return (
-                    <div key={p.id} onClick={() => onNavigate(VIEWS.PLANT_DETAIL, p)} style={{ display: 'flex', alignItems: 'center', gap: 14, padding: '12px 16px', backgroundColor: '#FFFBEB', border: '1px solid #FDE68A', borderRadius: 12, cursor: 'pointer' }}>
-                      {(p.thumbnail || p.mainImage) && <img src={p.thumbnail || p.mainImage} alt="" style={{ width: 44, height: 44, borderRadius: 10, objectFit: 'cover' }} />}
-                      <div style={{ flex: 1 }}>
-                        <p style={{ fontWeight: 600, color: '#111827', marginBottom: 2 }}>{p.name}</p>
-                        <p style={{ fontSize: 12, color: '#92400E' }}>{alerts[0]?.msg}</p>
-                      </div>
-                      <span style={{ color: '#D97706', fontSize: 18 }}>→</span>
+                {needsWater.slice(0, 3).map(p => (
+                  <div key={p.id} onClick={() => onNavigate(VIEWS.PLANT_DETAIL, p)} style={{ display: 'flex', alignItems: 'center', gap: 14, padding: '12px 16px', backgroundColor: '#FEF2F2', border: '1px solid #FECACA', borderRadius: 12, cursor: 'pointer' }}>
+                    {(p.thumbnail || p.mainImage) && <img src={p.thumbnail || p.mainImage} alt="" style={{ width: 44, height: 44, borderRadius: 10, objectFit: 'cover' }} />}
+                    <div style={{ flex: 1 }}>
+                      <p style={{ fontWeight: 600, color: '#111827', marginBottom: 2 }}>{p.name}</p>
+                      <p style={{ fontSize: 12, color: '#B91C1C' }}>🔴 Riego vencido</p>
                     </div>
-                  );
-                })}
+                    <span style={{ color: '#DC2626', fontSize: 18 }}>→</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Needs water soon */}
+          {needsWaterSoon.length > 0 && (
+            <div style={{ marginBottom: 28 }}>
+              <h2 style={{ fontSize: 18, fontWeight: 700, color: '#111827', marginBottom: 14 }}>⏰ Riego próximo</h2>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                {needsWaterSoon.slice(0, 2).map(p => (
+                  <div key={p.id} onClick={() => onNavigate(VIEWS.PLANT_DETAIL, p)} style={{ display: 'flex', alignItems: 'center', gap: 14, padding: '12px 16px', backgroundColor: '#FFFBEB', border: '1px solid #FDE68A', borderRadius: 12, cursor: 'pointer' }}>
+                    {(p.thumbnail || p.mainImage) && <img src={p.thumbnail || p.mainImage} alt="" style={{ width: 44, height: 44, borderRadius: 10, objectFit: 'cover' }} />}
+                    <div style={{ flex: 1 }}>
+                      <p style={{ fontWeight: 600, color: '#111827', marginBottom: 2 }}>{p.name}</p>
+                      <p style={{ fontSize: 12, color: '#92400E' }}>🟡 Próximo riego cercano</p>
+                    </div>
+                    <span style={{ color: '#D97706', fontSize: 18 }}>→</span>
+                  </div>
+                ))}
               </div>
             </div>
           )}
@@ -944,7 +1359,6 @@ function MyPlants({ plants, onNavigate }) {
 export default function Home() {
   const [ready, setReady] = useState(false);
   const [user, setUser] = useState(null);
-  const [isPremium, setIsPremium] = useState(false);
   const [showRegister, setShowRegister] = useState(false);
   const [showLogin, setShowLogin] = useState(false);
   const [authError, setAuthError] = useState('');
@@ -952,7 +1366,6 @@ export default function Home() {
   const [selectedPlant, setSelectedPlant] = useState(null);
   const [plants, setPlants] = useState([]);
   const [showAddPlant, setShowAddPlant] = useState(false);
-  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
   useEffect(() => {
     const init = async () => {
@@ -1007,7 +1420,6 @@ export default function Home() {
   const navigate = (destination, plant = null) => {
     setView(destination);
     setSelectedPlant(plant);
-    setMobileMenuOpen(false);
     if (destination === VIEWS.ADD_PLANT) setShowAddPlant(true);
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
@@ -1025,14 +1437,6 @@ export default function Home() {
     setPlants(updated);
     setSelectedPlant(updatedPlant);
     if (user) savePlants(user.email, updated);
-  };
-
-  const deletePlant = (plantId) => {
-    if (!confirm('¿Eliminar esta planta?')) return;
-    const updated = plants.filter(p => p.id !== plantId);
-    setPlants(updated);
-    if (user) savePlants(user.email, updated);
-    setView(VIEWS.MY_PLANTS);
   };
 
   if (!ready) return null;
@@ -1107,7 +1511,6 @@ export default function Home() {
       {/* ── MAIN CONTENT ── */}
       <main style={{ minHeight: 'calc(100vh - 64px)', paddingBottom: 40 }}>
         {!user ? (
-          /* ── LANDING (not logged in) ── */
           <div style={{ maxWidth: 1100, margin: '0 auto', padding: '80px 24px' }}>
             <div style={{ textAlign: 'center', marginBottom: 60 }}>
               <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8, backgroundColor: '#F0FDF4', border: '1px solid #BBF7D0', color: '#16A34A', fontSize: 13, fontWeight: 600, padding: '6px 16px', borderRadius: 20, marginBottom: 24 }}>
@@ -1124,8 +1527,6 @@ export default function Home() {
                 <button onClick={() => setShowLogin(true)} style={{ ...S.btnGhost, padding: '14px 28px', fontSize: 16 }}>Tengo una cuenta</button>
               </div>
             </div>
-
-            {/* Features */}
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 20 }}>
               {[
                 { icon: '🔬', title: 'Identificación IA', desc: 'Sube una foto y la IA identifica la especie, evalúa la salud y detecta enfermedades.' },
@@ -1142,25 +1543,16 @@ export default function Home() {
             </div>
           </div>
         ) : view === VIEWS.DASHBOARD ? (
-          <div className="fade-up">
-            <Dashboard plants={plants} onNavigate={navigate} />
-          </div>
+          <div className="fade-up"><Dashboard plants={plants} onNavigate={navigate} /></div>
         ) : view === VIEWS.MY_PLANTS ? (
-          <div className="fade-up">
-            <MyPlants plants={plants} onNavigate={navigate} />
-          </div>
+          <div className="fade-up"><MyPlants plants={plants} onNavigate={navigate} /></div>
         ) : view === VIEWS.PLANT_DETAIL && selectedPlant ? (
           <div className="fade-up">
-            <PlantDetail
-              plant={selectedPlant}
-              onBack={() => navigate(VIEWS.MY_PLANTS)}
-              onUpdate={updatePlant}
-            />
+            <PlantDetail plant={selectedPlant} onBack={() => navigate(VIEWS.MY_PLANTS)} onUpdate={updatePlant} />
           </div>
         ) : null}
       </main>
 
-      {/* Footer */}
       <footer style={{ borderTop: '1px solid #E5E7EB', padding: '20px 24px', backgroundColor: '#FFFFFF' }}>
         <div style={{ maxWidth: 1100, margin: '0 auto', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
@@ -1178,8 +1570,6 @@ export default function Home() {
 
 const S = {
   page: { fontFamily: "'DM Sans', sans-serif", backgroundColor: '#F8F7F2', color: '#1F2937', minHeight: '100vh' },
-
-  // Overlay / Modal
   overlay: { position: 'fixed', inset: 0, zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 },
   overlayBg: { position: 'absolute', inset: 0, backgroundColor: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(6px)' },
   modalCard: { position: 'relative', zIndex: 10, backgroundColor: '#FFFFFF', borderRadius: 24, padding: '32px 28px', width: '100%', maxWidth: 420, boxShadow: '0 24px 60px rgba(0,0,0,0.14)' },
@@ -1188,26 +1578,16 @@ const S = {
   modalSub: { fontSize: 14, color: '#6B7280' },
   closeBtn: { background: 'none', border: 'none', fontSize: 16, color: '#9CA3AF', cursor: 'pointer', padding: '4px 8px', borderRadius: 8 },
   errorBox: { backgroundColor: '#FEF2F2', border: '1px solid #FECACA', color: '#B91C1C', borderRadius: 10, padding: '10px 14px', fontSize: 13 },
-
-  // Form
   fieldGroup: { display: 'flex', flexDirection: 'column', gap: 6 },
   label: { fontSize: 13, fontWeight: 500, color: '#374151' },
   input: { padding: '10px 14px', borderRadius: 10, border: '1.5px solid #E5E7EB', fontSize: 14, color: '#111827', outline: 'none', backgroundColor: '#FAFAFA', fontFamily: "'DM Sans', sans-serif", transition: 'border-color 0.2s' },
-
-  // Buttons
   btnPrimary: { backgroundColor: '#16A34A', color: '#FFFFFF', border: 'none', borderRadius: 12, padding: '11px 20px', fontSize: 14, fontWeight: 700, cursor: 'pointer', transition: 'all 0.2s', boxShadow: '0 3px 10px rgba(22,163,74,0.25)', fontFamily: "'DM Sans', sans-serif" },
   btnOutline: { border: '1.5px solid #E5E7EB', background: '#FFFFFF', color: '#374151', borderRadius: 12, padding: '10px 18px', fontSize: 14, fontWeight: 600, cursor: 'pointer', transition: 'all 0.2s', fontFamily: "'DM Sans', sans-serif" },
   btnGhost: { backgroundColor: 'transparent', color: '#374151', border: '1.5px solid #E5E7EB', borderRadius: 10, padding: '7px 16px', fontSize: 13, fontWeight: 600, cursor: 'pointer', transition: 'all 0.2s', fontFamily: "'DM Sans', sans-serif" },
   btnNavPrimary: { backgroundColor: '#16A34A', color: '#fff', border: 'none', borderRadius: 10, padding: '8px 16px', fontSize: 13, fontWeight: 700, cursor: 'pointer', transition: 'all 0.2s', boxShadow: '0 2px 8px rgba(22,163,74,0.3)', fontFamily: "'DM Sans', sans-serif" },
-
-  // Drop zone
   dropZone: { position: 'relative', border: '2px dashed #D1D5DB', borderRadius: 16, overflow: 'hidden', display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'all 0.2s', backgroundColor: '#FAFAFA', cursor: 'pointer' },
   dropZoneActive: { borderColor: '#16A34A', backgroundColor: '#F0FDF4' },
-
-  // Spinner
   spinner: { width: 16, height: 16, border: '2px solid rgba(255,255,255,0.3)', borderTopColor: '#fff', borderRadius: '50%', display: 'inline-block', animation: 'spin 0.7s linear infinite' },
-
-  // Navbar
   navbar: { position: 'sticky', top: 0, zIndex: 100, backgroundColor: 'rgba(255,255,255,0.95)', backdropFilter: 'blur(12px)', borderBottom: '1px solid #E5E7EB', padding: '0 24px' },
   navInner: { maxWidth: 1200, margin: '0 auto', display: 'flex', alignItems: 'center', height: 64, gap: 16 },
   logoIcon: { width: 36, height: 36, backgroundColor: '#F0FDF4', borderRadius: 10, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 18, border: '1px solid #BBF7D0', flexShrink: 0 },
@@ -1217,7 +1597,5 @@ const S = {
   userAvatar: { width: 28, height: 28, borderRadius: '50%', backgroundColor: '#16A34A', color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12, fontWeight: 700, flexShrink: 0 },
   userName: { fontSize: 13, fontWeight: 600, color: '#111827', maxWidth: 80, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
   pillBtn: { fontSize: 12, fontWeight: 600, color: '#16A34A', background: 'none', border: 'none', cursor: 'pointer', whiteSpace: 'nowrap', fontFamily: "'DM Sans', sans-serif" },
-
-  // Plant card
-  plantCard: { backgroundColor: '#FFFFFF', border: '1px solid #E5E7EB', borderRadius: 18, overflow: 'hidden', cursor: 'pointer', transition: 'all 0.2s', ':hover': { transform: 'translateY(-2px)', boxShadow: '0 8px 24px rgba(0,0,0,0.08)' } },
+  plantCard: { backgroundColor: '#FFFFFF', border: '1px solid #E5E7EB', borderRadius: 18, overflow: 'hidden', cursor: 'pointer', transition: 'all 0.2s' },
 };
