@@ -1,6 +1,6 @@
 'use client';
 import { useState, useEffect } from 'react';
-import { supabase } from '../../lib/supabase'; // Ruta corregida a tu carpeta lib de la raíz
+import { supabase } from '../../lib/supabase'; 
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -251,7 +251,7 @@ function HistoryPanel({
   );
 }
 
-function PlanModal({ onClose }) {
+function PlanModal({ onClose , onBuy, isPremium}) {
   return (
     <div className="fixed inset-0 z-50 overflow-y-auto">
 
@@ -322,11 +322,25 @@ function PlanModal({ onClose }) {
                 <li>⭐ Seguimiento avanzado</li>
               </ul>
 
-              <button
-                className="mt-6 w-full bg-gradient-to-r from-cyan-500 via-blue-600 to-indigo-700 py-3 rounded-2xl font-bold hover:scale-[1.02] transition"
-              >
-                Comprar Premium
-              </button>
+              {isPremium ? (
+
+  <button
+    disabled
+    className="mt-6 w-full bg-green-600 py-3 rounded-2xl font-bold cursor-not-allowed"
+  >
+    ✅ Premium Activo
+  </button>
+
+) : (
+
+  <button
+    onClick={onBuy}
+    className="mt-6 w-full bg-gradient-to-r from-cyan-500 via-blue-600 to-indigo-700 py-3 rounded-2xl font-bold hover:scale-[1.02] transition"
+  >
+    Comprar Premium
+  </button>
+
+)}
 
             </div>
 
@@ -425,6 +439,7 @@ export default function Home() {
   const [showPlan, setShowPlan] = useState(false);
   // Ahora 'user' almacena un objeto { email, name } o null
   const [user, setUser] = useState(null);
+  const [isPremium, setIsPremium] = useState(false);
 
   const [showRegister, setShowRegister] = useState(false);
   const [showLogin, setShowLogin] = useState(false);
@@ -451,6 +466,20 @@ export default function Home() {
         const email = session.user.email;
         const name = session.user.user_metadata?.name || email;
         setUser({ email, name });
+        const { data: profile } = await supabase
+  .from('profiles')
+  .select('premium_until')
+  .eq('id', session.user.id)
+  .single();
+
+if (
+  profile?.premium_until &&
+  new Date(profile.premium_until) > new Date()
+) {
+  setIsPremium(true);
+} else {
+  setIsPremium(false);
+}
         setHistory(loadHistory(email));
       }
       setReady(true);
@@ -458,11 +487,25 @@ export default function Home() {
 
     initializeAuth();
 
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (_event, session) => {
       if (session?.user) {
         const email = session.user.email;
         const name = session.user.user_metadata?.name || email;
         setUser({ email, name });
+        const { data: profile } = await supabase
+  .from('profiles')
+  .select('premium_until')
+  .eq('id', session.user.id)
+  .single();
+
+if (
+  profile?.premium_until &&
+  new Date(profile.premium_until) > new Date()
+) {
+  setIsPremium(true);
+} else {
+  setIsPremium(false);
+}
         setHistory(loadHistory(email));
       } else {
         setUser(null);
@@ -509,11 +552,20 @@ export default function Home() {
     }
 
     if (data?.user) {
-      const uEmail = data.user.email;
-      const uName = data.user.user_metadata?.name || name || uEmail;
-      setUser({ email: uEmail, name: uName });
-      setHistory(loadHistory(uEmail));
-    }
+
+  await supabase
+    .from('profiles')
+    .insert({
+      id: data.user.id,
+      premium_until: null
+    });
+
+  const uEmail = data.user.email;
+  const uName = data.user.user_metadata?.name || name || uEmail;
+
+  setUser({ email: uEmail, name: uName });
+  setHistory(loadHistory(uEmail));
+}
     
     setShowRegister(false);
     setAuthError('');
@@ -557,6 +609,68 @@ export default function Home() {
     setResult('');
     setImage(null);
   };
+  const activatePremium = async () => {
+console.log("BOTON PREMIUM PRESIONADO");
+  if (!user) {
+    alert('Debes iniciar sesión');
+    return;
+  }
+
+  try {
+
+    const {
+      data: { user: currentUser }
+    } = await supabase.auth.getUser();
+      console.log("USER ID:", currentUser.id);
+    if (!currentUser) {
+      alert('Usuario no encontrado');
+      return;
+    }
+
+    const nextMonth = new Date();
+
+    nextMonth.setMonth(
+      nextMonth.getMonth() + 1
+    );
+const { data: profile } = await supabase
+    .from('profiles')
+    .select('*')
+    .eq('id', currentUser.id);
+
+  console.log("PROFILE FOUND:", profile);
+
+    const { data, error } = await supabase
+  .from('profiles')
+  .update({
+    premium_until: nextMonth.toISOString()
+  })
+  .eq('id', currentUser.id)
+  .select();
+
+console.log("UPDATE RESULT:", data);
+console.log("UPDATE ERROR:", error);
+
+    if (error) {
+      console.error(error);
+      alert('Error al activar Premium');
+      return;
+    }
+
+    setIsPremium(true);
+
+    alert(
+      `Premium activado hasta ${nextMonth.toLocaleDateString()}`
+    );
+
+  } catch (err) {
+
+    console.error(err);
+
+    alert(
+      'Ocurrió un error'
+    );
+  }
+};
 
   // ─── IMAGE ────────────────────────────────────────────────────────────────
 
@@ -721,6 +835,8 @@ export default function Home() {
       {showPlan && (
         <PlanModal
           onClose={() => setShowPlan(false)}
+          onBuy={activatePremium}
+          isPremium={isPremium}
         />
       )}
 
@@ -728,7 +844,7 @@ export default function Home() {
 
 <div className="absolute top-4 right-4 sm:top-6 sm:right-6 z-40">
 
-  <div className="flex items-center gap-3">
+  <div className="flex flex-wrap justify center items-center gap-2 sm:gap-3">
 
     {/* BOTÓN PREMIUM SIEMPRE VISIBLE */}
     <button
@@ -749,7 +865,11 @@ export default function Home() {
         <span className="text-sm text-slate-200 font-medium max-w-[120px] truncate">
           {user.name}
         </span>
-
+        {isPremium && (
+        <span className="bg-yellow-500 text-black text-[10px] px-2 py-1 rounded-full font-bold">
+          👑 PREMIUM
+        </span>
+        )}
         <button
           onClick={() => setShowHistory(true)}
           className="text-cyan-300 hover:text-cyan-100 text-xs font-semibold whitespace-nowrap"
@@ -939,7 +1059,7 @@ export default function Home() {
         {/* FOOTER */}
         <footer className="mt-20 text-center">
           <div className="inline-flex items-center gap-2 text-xs text-slate-500 border border-white/5 bg-white/5 backdrop-blur-md px-5 py-2 rounded-full">
-            © 2026 EcoScan AI • Hackathon Project BUild With AI
+            © 2026 EcoScan AI • Hackathon Project Build With AI
           </div>
         </footer>
 
