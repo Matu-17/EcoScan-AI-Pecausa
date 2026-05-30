@@ -1,6 +1,6 @@
 'use client';
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { supabase } from '../../lib/supabase';
+import { supabase, uploadImageToBucket, deleteImageFromBucket } from '../../lib/supabase';
 
 // ─── CONSTANTS ───────────────────────────────────────────────────────────────
 
@@ -54,22 +54,34 @@ function extractHealthAnalysis(result) {
 
 function getPlantsKey(email) { return `ecoscan_plants_${email.toLowerCase().trim()}`; }
 
+// ─── DB FUNCTIONS (Real Supabase Schema) ─────────────────────────────────────
+// Schema: plants(id, user_id, name, species, main_image_url, thumbnail_url,
+//   confidence, registered_at, last_photo_date, last_watered, last_fertilized,
+//   recommended_watering_days, recommended_fertilizer_days, fertilizer_type,
+//   sunlight, difficulty, notes, water_streak, activities, chat_history)
+// plant_updates(id, plant_id, image_url, thumbnail_url, analysis, update_type, created_at)
+// profiles(id, premium_until, created_at)
+
 async function fetchPlantsFromSupabase(userId, emailFallback) {
+  if (!userId || userId === 'undefined' || userId === 'null') {
+    console.warn('fetchPlantsFromSupabase: No valid userId, falling back to LocalStorage.');
+    try { const r = localStorage.getItem(getPlantsKey(emailFallback)); return r ? JSON.parse(r) : []; } catch { return []; }
+  }
   try {
+    // Fetch plants joined with their updates
     const { data, error } = await supabase
       .from('plants')
-      .select('*')
+      .select('*, plant_updates(*)')
       .eq('user_id', userId)
       .order('created_at', { ascending: false });
-    
     if (error) throw error;
-    
+
     return data.map(dbPlant => ({
       id: dbPlant.id,
       name: dbPlant.name,
       species: dbPlant.species,
-      thumbnail: dbPlant.thumbnail,
-      mainImage: dbPlant.main_image,
+      thumbnail: dbPlant.thumbnail_url,
+      mainImage: dbPlant.main_image_url,
       registeredAt: dbPlant.registered_at,
       lastPhotoDate: dbPlant.last_photo_date,
       lastWatered: dbPlant.last_watered,
@@ -82,67 +94,53 @@ async function fetchPlantsFromSupabase(userId, emailFallback) {
       sunlight: dbPlant.sunlight,
       difficulty: dbPlant.difficulty,
       activities: dbPlant.activities || [],
-      updates: dbPlant.updates || [],
+      updates: (dbPlant.plant_updates || []).sort((a, b) => new Date(b.created_at) - new Date(a.created_at)).map(u => ({
+        id: u.id,
+        date: u.created_at,
+        image: u.image_url,
+        thumbnail: u.thumbnail_url,
+        analysis: u.analysis,
+        type: u.update_type,
+      })),
       chatHistory: dbPlant.chat_history || [],
-      notes: dbPlant.notes || ''
+      notes: dbPlant.notes || '',
     }));
   } catch (err) {
-    console.error('Error fetching plants from Supabase, falling back to LocalStorage:', err);
-    try {
-      const r = localStorage.getItem(getPlantsKey(emailFallback));
-      return r ? JSON.parse(r) : [];
-    } catch {
-      return [];
-    }
+    console.error('Error fetching plants from Supabase, falling back to LocalStorage:', err?.message || err);
+    try { const r = localStorage.getItem(getPlantsKey(emailFallback)); return r ? JSON.parse(r) : []; } catch { return []; }
   }
 }
 
-async function dbInsertPlant(userId, plant, emailFallback) {
-  try {
-    const dbPlant = {
-      id: plant.id,
-      user_id: userId,
-      name: plant.name,
-      species: plant.species,
-      thumbnail: plant.thumbnail,
-      main_image: plant.mainImage,
-      registered_at: plant.registeredAt,
-      last_photo_date: plant.lastPhotoDate,
-      last_watered: plant.lastWatered,
-      last_fertilized: plant.lastFertilized,
-      water_streak: plant.waterStreak || 0,
-      confidence: plant.confidence,
-      recommended_watering_days: plant.recommendedWateringDays,
-      recommended_fertilizer_days: plant.recommendedFertilizerDays,
-      fertilizer_type: plant.fertilizerType,
-      sunlight: plant.sunlight,
-      difficulty: plant.difficulty,
-      activities: plant.activities || [],
-      updates: plant.updates || [],
-      chat_history: plant.chatHistory || [],
-      notes: plant.notes || ''
-    };
-    const { error } = await supabase.from('plants').insert(dbPlant);
-    if (error) throw error;
-  } catch (err) {
-    console.error('Error inserting plant into Supabase:', err);
-  }
-  // LocalStorage fallback cache update
+// Insert a new plant. Premium users: images go to bucket. Free users: LocalStorage only.
+async function dbInsertPlant(userId, plant, emailFallback, userPlan = 'free') {
+  // Always update LocalStorage as cache
   try {
     const key = getPlantsKey(emailFallback);
     const local = localStorage.getItem(key);
     const list = local ? JSON.parse(local) : [];
     localStorage.setItem(key, JSON.stringify([plant, ...list.filter(p => p.id !== plant.id)]));
   } catch {}
-}
 
-async function dbUpdatePlant(userId, plant, emailFallback) {
+  if (!userId || userPlan !== 'premium') return; // Free users: LocalStorage only
+
   try {
+    // Upload main image and thumbnail to bucket
+    const mainPath = `${userId}/${plant.id}/main.jpg`;
+    const thumbPath = `${userId}/${plant.id}/thumb.jpg`;
+    const mainUrl = plant.mainImage?.startsWith('data:')
+      ? await uploadImageToBucket(plant.mainImage, mainPath)
+      : plant.mainImage;
+    const thumbUrl = plant.thumbnail?.startsWith('data:')
+      ? await uploadImageToBucket(plant.thumbnail, thumbPath)
+      : plant.thumbnail;
+
     const dbPlant = {
+      id: plant.id,
+      user_id: userId,
       name: plant.name,
       species: plant.species,
-      thumbnail: plant.thumbnail,
-      main_image: plant.mainImage,
+      main_image_url: mainUrl,
+      thumbnail_url: thumbUrl,
       registered_at: plant.registeredAt,
       last_photo_date: plant.lastPhotoDate,
       last_watered: plant.lastWatered,
@@ -155,9 +153,59 @@ async function dbUpdatePlant(userId, plant, emailFallback) {
       sunlight: plant.sunlight,
       difficulty: plant.difficulty,
       activities: plant.activities || [],
-      updates: plant.updates || [],
       chat_history: plant.chatHistory || [],
-      notes: plant.notes || ''
+      notes: plant.notes || '',
+    };
+    const { error } = await supabase.from('plants').insert(dbPlant);
+    if (error) throw error;
+
+    // Insert the initial photo update into plant_updates
+    if (plant.updates?.[0]) {
+      const firstUpdate = plant.updates[0];
+      const updateImageUrl = firstUpdate.image?.startsWith('data:')
+        ? await uploadImageToBucket(firstUpdate.image, `${userId}/${plant.id}/update_${firstUpdate.id}.jpg`)
+        : firstUpdate.image;
+      const updateThumbUrl = firstUpdate.thumbnail?.startsWith('data:')
+        ? await uploadImageToBucket(firstUpdate.thumbnail, `${userId}/${plant.id}/thumb_${firstUpdate.id}.jpg`)
+        : firstUpdate.thumbnail;
+      await supabase.from('plant_updates').insert({
+        plant_id: plant.id,
+        image_url: updateImageUrl,
+        thumbnail_url: updateThumbUrl,
+        analysis: firstUpdate.analysis,
+        update_type: firstUpdate.type || 'initial',
+      });
+    }
+  } catch (err) {
+    console.error('Error inserting plant into Supabase:', err?.message || err);
+  }
+}
+
+// Update a plant's fields in Supabase (premium only).
+async function dbUpdatePlant(userId, plant, emailFallback, userPlan = 'free') {
+  // Always update LocalStorage as cache
+  try {
+    const key = getPlantsKey(emailFallback);
+    const local = localStorage.getItem(key);
+    if (local) {
+      const list = JSON.parse(local);
+      localStorage.setItem(key, JSON.stringify(list.map(p => p.id === plant.id ? plant : p)));
+    }
+  } catch {}
+
+  if (!userId || userPlan !== 'premium') return;
+
+  try {
+    const dbPlant = {
+      name: plant.name,
+      species: plant.species,
+      last_watered: plant.lastWatered,
+      last_fertilized: plant.lastFertilized,
+      water_streak: plant.waterStreak || 0,
+      activities: plant.activities || [],
+      chat_history: plant.chatHistory || [],
+      notes: plant.notes || '',
+      last_photo_date: plant.lastPhotoDate,
     };
     const { error } = await supabase
       .from('plants')
@@ -166,41 +214,88 @@ async function dbUpdatePlant(userId, plant, emailFallback) {
       .eq('user_id', userId);
     if (error) throw error;
   } catch (err) {
-    console.error('Error updating plant in Supabase:', err);
+    console.error('Error updating plant in Supabase:', err?.message || err);
   }
-  // LocalStorage fallback cache update
-  try {
-    const key = getPlantsKey(emailFallback);
-    const local = localStorage.getItem(key);
-    if (local) {
-      const list = JSON.parse(local);
-      const updatedList = list.map(p => p.id === plant.id ? plant : p);
-      localStorage.setItem(key, JSON.stringify(updatedList));
-    }
-  } catch {}
 }
 
-async function dbDeletePlant(userId, plantId, emailFallback) {
+// Insert a new photo update entry into plant_updates (premium only).
+async function dbInsertPlantUpdate(userId, plantId, updateEntry, userPlan = 'free') {
+  if (!userId || userPlan !== 'premium') return;
   try {
-    const { error } = await supabase
-      .from('plants')
-      .delete()
-      .eq('id', plantId)
-      .eq('user_id', userId);
+    const imageUrl = updateEntry.image?.startsWith('data:')
+      ? await uploadImageToBucket(updateEntry.image, `${userId}/${plantId}/update_${updateEntry.id}.jpg`)
+      : updateEntry.image;
+    const thumbUrl = updateEntry.thumbnail?.startsWith('data:')
+      ? await uploadImageToBucket(updateEntry.thumbnail, `${userId}/${plantId}/thumb_${updateEntry.id}.jpg`)
+      : updateEntry.thumbnail;
+
+    // Also update the plant's main_image_url and thumbnail_url to the latest photo
+    await supabase.from('plants')
+      .update({ main_image_url: imageUrl, thumbnail_url: thumbUrl, last_photo_date: updateEntry.date })
+      .eq('id', plantId).eq('user_id', userId);
+
+    const { error } = await supabase.from('plant_updates').insert({
+      plant_id: plantId,
+      image_url: imageUrl,
+      thumbnail_url: thumbUrl,
+      analysis: updateEntry.analysis,
+      update_type: updateEntry.type || 'update',
+    });
     if (error) throw error;
   } catch (err) {
-    console.error('Error deleting plant from Supabase:', err);
+    console.error('Error inserting plant_update:', err?.message || err);
   }
-  // LocalStorage fallback cache update
+}
+
+// Delete a plant from Supabase (premium only). plant_updates cascade-deletes.
+async function dbDeletePlant(userId, plantId, emailFallback, userPlan = 'free') {
+  // Always update LocalStorage
   try {
     const key = getPlantsKey(emailFallback);
     const local = localStorage.getItem(key);
-    if (local) {
-      const list = JSON.parse(local);
-      const updatedList = list.filter(p => p.id !== plantId);
-      localStorage.setItem(key, JSON.stringify(updatedList));
-    }
+    if (local) localStorage.setItem(key, JSON.stringify(JSON.parse(local).filter(p => p.id !== plantId)));
   } catch {}
+
+  if (!userId || userPlan !== 'premium') return;
+
+  try {
+    const { error } = await supabase.from('plants').delete().eq('id', plantId).eq('user_id', userId);
+    if (error) throw error;
+  } catch (err) {
+    console.error('Error deleting plant from Supabase:', err?.message || err);
+  }
+}
+
+// ─── PLAN HELPERS (Supabase) ──────────────────────────────────────────────────
+
+// Read premium_until from profiles table and determine current plan.
+async function fetchUserPlan(userId) {
+  if (!userId) return 'free';
+  try {
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('premium_until')
+      .eq('id', userId)
+      .single();
+    if (error) throw error;
+    if (data?.premium_until && new Date(data.premium_until) > new Date()) return 'premium';
+    return 'free';
+  } catch (err) {
+    console.warn('Could not fetch user plan, defaulting to free:', err?.message);
+    return 'free';
+  }
+}
+
+// Activate premium for 30 days by updating profiles.premium_until.
+async function activatePremium(userId) {
+  if (!userId) throw new Error('No userId provided');
+  const premiumUntil = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+  const { error } = await supabase
+    .from('profiles')
+    .update({ premium_until: premiumUntil })
+    .eq('id', userId);
+  if (error) throw error;
+  return premiumUntil;
 }
 
 // ─── PLAN HELPERS ─────────────────────────────────────────────────────────────
@@ -403,12 +498,46 @@ function UsageCounter({ used, total, label, icon }) {
 
 // ─── UPGRADE MODAL ─────────────────────────────────────────────────────────────
 
-function UpgradeModal({ reason, onClose }) {
+function UpgradeModal({ reason, onClose, onUpgrade }) {
+  const [loading, setLoading] = useState(false);
+  const [success, setSuccess] = useState(false);
+  const [err, setErr] = useState('');
   const reasons = {
     plants: { icon: '🌱', title: 'Límite de plantas alcanzado', desc: 'El plan gratuito permite registrar hasta 1 planta. Actualiza a Premium para jardines ilimitados.' },
     chat: { icon: '💬', title: 'Límite de mensajes alcanzado', desc: `Has usado los ${FREE_CHAT_DAILY_LIMIT} mensajes gratuitos de hoy. Actualiza a Premium para chat ilimitado.` },
   };
   const info = reasons[reason] || reasons.plants;
+
+  const handleUpgrade = async () => {
+    setLoading(true); setErr('');
+    try {
+      await onUpgrade();
+      setSuccess(true);
+    } catch (e) {
+      setErr('No se pudo activar el plan. Intenta de nuevo.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  if (success) {
+    return (
+      <div style={S.overlay}>
+        <div style={S.overlayBg} onClick={onClose} />
+        <div style={{ ...S.modalCard, maxWidth: 400, textAlign: 'center' }}>
+          <div style={{ fontSize: 64, marginBottom: 12 }}>⭐</div>
+          <h2 style={{ fontSize: 22, fontWeight: 800, color: '#92400E', marginBottom: 8 }}>¡Ya eres Premium!</h2>
+          <p style={{ fontSize: 14, color: '#6B7280', marginBottom: 24, lineHeight: 1.6 }}>
+            Tu plan se ha activado por <strong>30 días</strong>. Ahora puedes registrar plantas ilimitadas y usar el chat sin restricciones.
+          </p>
+          <button onClick={onClose} style={{ ...S.btnPrimary, width: '100%', backgroundColor: '#D97706' }}>
+            🌿 ¡Empezar a usar Premium!
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div style={S.overlay}>
       <div style={S.overlayBg} onClick={onClose} />
@@ -419,20 +548,31 @@ function UpgradeModal({ reason, onClose }) {
         <p style={{ fontSize: 14, color: '#6B7280', lineHeight: 1.6, marginBottom: 24 }}>{info.desc}</p>
         <div style={{ backgroundColor: '#FFFBEB', border: '1px solid #FDE68A', borderRadius: 14, padding: '16px 18px', marginBottom: 24, textAlign: 'left' }}>
           <p style={{ fontSize: 13, fontWeight: 700, color: '#92400E', marginBottom: 10 }}>⭐ Plan Premium incluye:</p>
-          {['Plantas ilimitadas', 'Chat IA ilimitado', 'Análisis avanzados', 'Sin restricciones'].map(f => (
+          {['Plantas ilimitadas', 'Chat IA ilimitado', 'Imágenes guardadas en la nube', 'Historial de fotos permanente'].map(f => (
             <div key={f} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6, fontSize: 13, color: '#374151' }}>
               <span style={{ color: '#16A34A' }}>✓</span> {f}
             </div>
           ))}
         </div>
-        <button style={{ ...S.btnPrimary, width: '100%', backgroundColor: '#D97706', boxShadow: '0 3px 10px rgba(217,119,6,0.3)' }}>
-          ⭐ Actualizar a Premium
+        <div style={{ backgroundColor: '#F0FDF4', border: '1px solid #BBF7D0', borderRadius: 10, padding: '10px 14px', marginBottom: 16, fontSize: 13, color: '#15803D', fontWeight: 600 }}>
+          🎁 Demo del Hackathon: 30 días gratis
+        </div>
+        {err && <div style={{ ...S.errorBox, marginBottom: 12 }}>{err}</div>}
+        <button
+          onClick={handleUpgrade}
+          disabled={loading}
+          style={{ ...S.btnPrimary, width: '100%', backgroundColor: '#D97706', boxShadow: '0 3px 10px rgba(217,119,6,0.3)', opacity: loading ? 0.7 : 1 }}
+        >
+          {loading
+            ? <span style={{ display: 'flex', alignItems: 'center', gap: 8, justifyContent: 'center' }}><span style={S.spinner} />Activando Premium...</span>
+            : '⭐ Activar Premium ahora — GRATIS'}
         </button>
         <button onClick={onClose} style={{ ...S.btnGhost, width: '100%', marginTop: 10 }}>Continuar gratis</button>
       </div>
     </div>
   );
 }
+
 
 // ─── AUTH MODAL ──────────────────────────────────────────────────────────────
 
@@ -702,7 +842,7 @@ function AddPlantFlow({ onClose, onSave, user }) {
                     color: '#6B7280', fontSize: 14, cursor: 'pointer', textAlign: 'left',
                   }}
                 >
-                  🔍 Registrar como "Desconocida" (identificar más tarde)
+                  🔍 Registrar como &quot;Desconocida&quot; (identificar más tarde)
                 </button>
               </div>
             ) : (
@@ -948,6 +1088,7 @@ function PlantCard({ plant, onClick }) {
 
 function PlantDetail({ plant: initialPlant, onBack, onUpdate, onDelete, userPlan, userEmail }) {
   const [plant, setPlant] = useState(initialPlant);
+  const [prevId, setPrevId] = useState(initialPlant.id);
   const [activeTab, setActiveTab] = useState('overview');
   const [chatInput, setChatInput] = useState('');
   const [chatLoading, setChatLoading] = useState(false);
@@ -960,10 +1101,11 @@ function PlantDetail({ plant: initialPlant, onBack, onUpdate, onDelete, userPlan
   const chatEndRef = useRef(null);
   const chatImageInputRef = useRef(null);
 
-  // FIX #6: sync local plant state when parent prop changes (e.g. after update from another source)
-  useEffect(() => {
+  // Sync local plant state when parent prop changes (e.g. after update from another source)
+  if (initialPlant.id !== prevId) {
+    setPrevId(initialPlant.id);
     setPlant(initialPlant);
-  }, [initialPlant.id]);
+  }
 
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [plant.chatHistory]);
 
