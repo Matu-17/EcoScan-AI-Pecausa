@@ -6,14 +6,6 @@ EcoScan AI es una plataforma web inteligente diseñada para combatir la alta tas
 
 ---
 
-## 👥 Colaboradores / Integrantes de Equipo
-* **[Ingresa Nombre Integrante 1]** - Rol (Ej. Backend / AI Specialist)
-* **[Ingresa Nombre Integrante 2]** - Rol (Ej. Frontend / UI Designer)
-* **[Ingresa Nombre Integrante 3]** - Rol (Ej. Business Analyst / Pitch Specialist)
-*(Agrega o edita los colaboradores antes de realizar la entrega oficial).*
-
----
-
 ## 📂 Documentación del Proyecto (Negocio y Presentación)
 Para cumplir con los entregables obligatorios de la hackathon, el proyecto incluye los siguientes documentos estratégicos:
 1. **[BUSINESS.md](BUSINESS.md):** Contiene el análisis macro del entorno (**PESTEL**), el análisis de la solución (**FODA**), el modelo de negocio (**Lean Canvas**), el **Estudio de Viabilidad Financiera** (costos de API Gemini vs. ingresos Premium) y el **Impacto Regional** en Santa Cruz de la Sierra.
