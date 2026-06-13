@@ -2000,8 +2000,10 @@ export default function Home() {
     if (data?.user) {
       const u = { email: data.user.email, name: data.user.user_metadata?.full_name || data.user.user_metadata?.name || data.user.email, id: data.user.id };
       setUser(u);
-      setPlants(loadPlants(u.email));
-      setUserPlan(loadUserPlan(u.email));
+      const list = await fetchPlantsFromSupabase(u.id, u.email);
+      setPlants(list);
+      const plan = await fetchUserPlan(u.id);
+      setUserPlan(plan);
     }
     setShowLogin(false); setAuthError('');
   };
