@@ -1,5 +1,5 @@
 'use client';
-import { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { supabase, uploadImageToBucket, deleteImageFromBucket } from '../../lib/supabase';
 
 // ─── CONSTANTS ───────────────────────────────────────────────────────────────
@@ -1937,9 +1937,47 @@ function MyPlants({ plants, onNavigate }) {
   );
 }
 
+// ─── ERROR BOUNDARY ───────────────────────────────────────────────────────────
+
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
+  }
+  componentDidCatch(error, errorInfo) {
+    console.error('ErrorBoundary caught:', error, errorInfo);
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: "'DM Sans', sans-serif", backgroundColor: '#F8F7F2', padding: 24 }}>
+          <div style={{ textAlign: 'center', maxWidth: 420 }}>
+            <div style={{ fontSize: 48, marginBottom: 16 }}>🌿</div>
+            <h2 style={{ fontSize: 22, fontWeight: 700, color: '#111827', marginBottom: 8 }}>Algo salió mal</h2>
+            <p style={{ fontSize: 14, color: '#6B7280', marginBottom: 24, lineHeight: 1.6 }}>Ocurrió un error inesperado. Intenta recargar la página.</p>
+            <button onClick={() => { this.setState({ hasError: false, error: null }); window.location.reload(); }} style={{ backgroundColor: '#16A34A', color: '#fff', border: 'none', borderRadius: 12, padding: '12px 24px', fontSize: 14, fontWeight: 700, cursor: 'pointer' }}>Recargar página</button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 // ─── MAIN APP ─────────────────────────────────────────────────────────────────
 
 export default function Home() {
+  return (
+    <ErrorBoundary>
+      <HomeInner />
+    </ErrorBoundary>
+  );
+}
+
+function HomeInner() {
   const [ready, setReady] = useState(false);
   const [user, setUser] = useState(null);
   const [userPlan, setUserPlan] = useState('free'); // FIX #4
@@ -1955,31 +1993,50 @@ export default function Home() {
 
   useEffect(() => {
     const init = async () => {
-      const { data: { session } } = await supabase.auth.getSession();
-      if (session?.user) {
-        const u = { email: session.user.email, name: session.user.user_metadata?.full_name || session.user.user_metadata?.name || session.user.email, id: session.user.id };
-        setUser(u);
-        const list = await fetchPlantsFromSupabase(u.id, u.email);
-        setPlants(list);
-        const plan = await fetchUserPlan(u.id);
-        setUserPlan(plan);
+      try {
+        const { data } = await supabase.auth.getSession();
+        const session = data?.session;
+        if (session?.user) {
+          const u = { email: session.user.email, name: session.user.user_metadata?.full_name || session.user.user_metadata?.name || session.user.email, id: session.user.id };
+          setUser(u);
+          try {
+            const list = await fetchPlantsFromSupabase(u.id, u.email);
+            setPlants(list || []);
+          } catch (e) { console.error('Error loading plants on init:', e); }
+          try {
+            const plan = await fetchUserPlan(u.id);
+            setUserPlan(plan || 'free');
+          } catch (e) { console.error('Error loading plan on init:', e); }
+        }
+      } catch (err) {
+        console.error('Error during session init:', err);
+      } finally {
+        setReady(true);
       }
-      setReady(true);
     };
     init();
-    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (_e, session) => {
-      if (session?.user) {
-        const u = { email: session.user.email, name: session.user.user_metadata?.full_name || session.user.user_metadata?.name || session.user.email, id: session.user.id };
-        setUser(u);
-        const list = await fetchPlantsFromSupabase(u.id, u.email);
-        setPlants(list);
-        const plan = await fetchUserPlan(u.id);
-        setUserPlan(plan);
-      } else {
-        setUser(null); setPlants([]); setUserPlan('free');
+    const { data: authListener } = supabase.auth.onAuthStateChange(async (_e, session) => {
+      try {
+        if (session?.user) {
+          const u = { email: session.user.email, name: session.user.user_metadata?.full_name || session.user.user_metadata?.name || session.user.email, id: session.user.id };
+          setUser(u);
+          try {
+            const list = await fetchPlantsFromSupabase(u.id, u.email);
+            setPlants(list || []);
+          } catch (e) { console.error('Error loading plants on auth change:', e); }
+          try {
+            const plan = await fetchUserPlan(u.id);
+            setUserPlan(plan || 'free');
+          } catch (e) { console.error('Error loading plan on auth change:', e); }
+        } else {
+          setUser(null); setPlants([]); setUserPlan('free');
+        }
+      } catch (err) {
+        console.error('Error in onAuthStateChange:', err);
       }
     });
-    return () => subscription.unsubscribe();
+    const subscription = authListener?.subscription;
+    return () => { if (subscription) subscription.unsubscribe(); };
   }, []);
 
   const handleRegister = async (email, password, name) => {
@@ -2079,7 +2136,14 @@ export default function Home() {
     setView(VIEWS.MY_PLANTS);
   }, [user]);
 
-  if (!ready) return null;
+  if (!ready) return (
+    <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: "'DM Sans', sans-serif", backgroundColor: '#F8F7F2' }}>
+      <div style={{ textAlign: 'center' }}>
+        <div style={{ fontSize: 40, marginBottom: 12, animation: 'spin 2s linear infinite' }}>🌿</div>
+        <p style={{ fontSize: 14, color: '#9CA3AF' }}>Cargando EcoScan AI...</p>
+      </div>
+    </div>
+  );
 
   const navItems = [
     { id: VIEWS.DASHBOARD, label: '🏠 Panel', icon: '🏠' },
