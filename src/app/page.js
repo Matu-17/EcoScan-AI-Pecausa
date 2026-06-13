@@ -1961,7 +1961,8 @@ export default function Home() {
         setUser(u);
         const list = await fetchPlantsFromSupabase(u.id, u.email);
         setPlants(list);
-        setUserPlan(loadUserPlan(u.email)); // FIX #4
+        const plan = await fetchUserPlan(u.id);
+        setUserPlan(plan);
       }
       setReady(true);
     };
@@ -1972,7 +1973,8 @@ export default function Home() {
         setUser(u);
         const list = await fetchPlantsFromSupabase(u.id, u.email);
         setPlants(list);
-        setUserPlan(loadUserPlan(u.email)); // FIX #4
+        const plan = await fetchUserPlan(u.id);
+        setUserPlan(plan);
       } else {
         setUser(null); setPlants([]); setUserPlan('free');
       }
