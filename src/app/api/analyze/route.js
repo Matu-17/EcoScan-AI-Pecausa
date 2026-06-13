@@ -62,9 +62,96 @@ async function callGeminiWithFallback(contents) {
   }
 }
 
+async function* callGeminiStream(contents, modelName = 'gemini-2.5-flash') {
+  const responseStream = await ai.models.generateContentStream({
+    model: modelName,
+    contents,
+  });
+  for await (const chunk of responseStream) {
+    if (chunk.text) {
+      yield chunk.text;
+    }
+  }
+}
+
+async function* callGeminiStreamWithFallback(contents) {
+  try {
+    yield* callGeminiStream(contents, 'gemini-2.5-flash');
+  } catch (err) {
+    const errStr = JSON.stringify(err);
+    if (errStr.includes('429') || errStr.includes('503')) {
+      console.warn('Primary model quota hit, trying fallback for stream...');
+      yield* callGeminiStream(contents, 'gemini-1.5-flash');
+      return;
+    }
+    throw err;
+  }
+}
+
 export async function POST(request) {
   try {
     const body = await request.json();
+
+    // ── CHAT / TEXT ANALYSIS (with stream) ──────────────────────────────────
+    if (body.message) {
+      const systemPrompt = body.systemPrompt || CHAT_SYSTEM_DEFAULT;
+      const userMessage = body.message;
+
+      const contents = [];
+
+      // Add image if present in the chat message
+      if (body.image) {
+        const base64Data = body.image.split(',')[1];
+        if (base64Data) {
+          contents.push({
+            inlineData: {
+              data: base64Data,
+              mimeType: 'image/jpeg',
+            },
+          });
+        }
+      }
+
+      const conversationContents = [];
+
+      // Include system context as first user turn if provided
+      if (body.systemPrompt) {
+        conversationContents.push(`[CONTEXTO DEL SISTEMA]\n${systemPrompt}\n\n[FIN CONTEXTO]`);
+      }
+
+      // Add prior chat history (last 6 turns)
+      if (body.chatHistory && body.chatHistory.length > 0) {
+        for (const msg of body.chatHistory.slice(-6)) {
+          conversationContents.push(`${msg.role === 'user' ? 'Usuario' : 'Asistente'}: ${msg.content}`);
+        }
+      }
+
+      conversationContents.push(`Usuario: ${userMessage}\nAsistente:`);
+      contents.push(conversationContents.join('\n\n'));
+
+      const encoder = new TextEncoder();
+      const stream = new ReadableStream({
+        async start(controller) {
+          try {
+            for await (const chunk of callGeminiStreamWithFallback(contents)) {
+              controller.enqueue(encoder.encode(chunk));
+            }
+          } catch (error) {
+            console.error('Error in streaming chatbot response:', error);
+            controller.error(error);
+          } finally {
+            controller.close();
+          }
+        },
+      });
+
+      return new Response(stream, {
+        headers: {
+          'Content-Type': 'text/plain; charset=utf-8',
+          'Transfer-Encoding': 'chunked',
+        },
+      });
+    }
 
     // ── PLANT IDENTIFICATION (image-based) ──────────────────────────────────
     if (body.image) {
@@ -112,10 +199,10 @@ export async function POST(request) {
       }
     }
 
-    // ── CHAT / TEXT ANALYSIS (no image) ────────────────────────────────────
-    if (body.message || body.prompt) {
+    // ── FALLBACK PROMPT ANALYSIS (no image, non-streamed) ──────────────────
+    if (body.prompt) {
       const systemPrompt = body.systemPrompt || CHAT_SYSTEM_DEFAULT;
-      const userMessage = body.message || body.prompt;
+      const userMessage = body.prompt;
 
       const conversationContents = [];
 

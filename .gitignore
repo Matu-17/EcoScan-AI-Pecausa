@@ -39,3 +39,8 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# docs extras
+INSTRUCCIONES_SUPABASE.md
+Build_With_AI_2026_Lineamientos_CompletosV1.pdf
+*.pdf

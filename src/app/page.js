@@ -28,6 +28,24 @@ function createThumbnail(base64Image) {
   });
 }
 
+function compressImage(base64Image, maxWidth = 800) {
+  if (!base64Image || !base64Image.startsWith('data:')) return Promise.resolve(base64Image);
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      let w = img.width, h = img.height;
+      if (w > maxWidth) { h = Math.round(h * maxWidth / w); w = maxWidth; }
+      canvas.width = w; canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, w, h);
+      resolve(canvas.toDataURL('image/jpeg', 0.8));
+    };
+    img.onerror = () => resolve(base64Image);
+    img.src = base64Image;
+  });
+}
+
 // FIX #1: Extract health_analysis safely from AI response (string or parsed JSON)
 function extractHealthAnalysis(result) {
   if (!result) return 'No se pudo obtener análisis de salud.';
@@ -68,10 +86,10 @@ async function fetchPlantsFromSupabase(userId, emailFallback) {
     try { const r = localStorage.getItem(getPlantsKey(emailFallback)); return r ? JSON.parse(r) : []; } catch { return []; }
   }
   try {
-    // Fetch plants joined with their updates
+    // Fetch plants
     const { data, error } = await supabase
       .from('plants')
-      .select('*, plant_updates(*)')
+      .select('*')
       .eq('user_id', userId)
       .order('created_at', { ascending: false });
     if (error) throw error;
@@ -80,8 +98,8 @@ async function fetchPlantsFromSupabase(userId, emailFallback) {
       id: dbPlant.id,
       name: dbPlant.name,
       species: dbPlant.species,
-      thumbnail: dbPlant.thumbnail_url,
-      mainImage: dbPlant.main_image_url,
+      thumbnail: dbPlant.thumbnail,
+      mainImage: dbPlant.main_image,
       registeredAt: dbPlant.registered_at,
       lastPhotoDate: dbPlant.last_photo_date,
       lastWatered: dbPlant.last_watered,
@@ -94,14 +112,7 @@ async function fetchPlantsFromSupabase(userId, emailFallback) {
       sunlight: dbPlant.sunlight,
       difficulty: dbPlant.difficulty,
       activities: dbPlant.activities || [],
-      updates: (dbPlant.plant_updates || []).sort((a, b) => new Date(b.created_at) - new Date(a.created_at)).map(u => ({
-        id: u.id,
-        date: u.created_at,
-        image: u.image_url,
-        thumbnail: u.thumbnail_url,
-        analysis: u.analysis,
-        type: u.update_type,
-      })),
+      updates: dbPlant.updates || [],
       chatHistory: dbPlant.chat_history || [],
       notes: dbPlant.notes || '',
     }));
@@ -121,26 +132,40 @@ async function dbInsertPlant(userId, plant, emailFallback, userPlan = 'free') {
     localStorage.setItem(key, JSON.stringify([plant, ...list.filter(p => p.id !== plant.id)]));
   } catch {}
 
-  if (!userId || userPlan !== 'premium') return; // Free users: LocalStorage only
+  if (!userId) return;
 
   try {
-    // Upload main image and thumbnail to bucket
-    const mainPath = `${userId}/${plant.id}/main.jpg`;
-    const thumbPath = `${userId}/${plant.id}/thumb.jpg`;
-    const mainUrl = plant.mainImage?.startsWith('data:')
-      ? await uploadImageToBucket(plant.mainImage, mainPath)
-      : plant.mainImage;
-    const thumbUrl = plant.thumbnail?.startsWith('data:')
-      ? await uploadImageToBucket(plant.thumbnail, thumbPath)
-      : plant.thumbnail;
+    let mainUrl = plant.mainImage;
+    let thumbUrl = plant.thumbnail;
+    let processedUpdates = plant.updates || [];
+    
+    // Process images only if premium
+    if (userPlan === 'premium') {
+      const mainPath = `${userId}/${plant.id}/main.jpg`;
+      const thumbPath = `${userId}/${plant.id}/thumb.jpg`;
+      mainUrl = plant.mainImage?.startsWith('data:') ? await uploadImageToBucket(plant.mainImage, mainPath) : plant.mainImage;
+      thumbUrl = plant.thumbnail?.startsWith('data:') ? await uploadImageToBucket(plant.thumbnail, thumbPath) : plant.thumbnail;
+      
+      processedUpdates = await Promise.all((plant.updates || []).map(async u => {
+        const uImage = u.image?.startsWith('data:') ? await uploadImageToBucket(u.image, `${userId}/${plant.id}/update_${u.id}.jpg`) : u.image;
+        const uThumb = u.thumbnail?.startsWith('data:') ? await uploadImageToBucket(u.thumbnail, `${userId}/${plant.id}/thumb_${u.id}.jpg`) : u.thumbnail;
+        return { ...u, image: uImage, thumbnail: uThumb };
+      }));
+    } else {
+      // Compress images for free users to avoid Payload Too Large errors
+      mainUrl = await compressImage(plant.mainImage, 800);
+      processedUpdates = await Promise.all((plant.updates || []).map(async u => {
+        return { ...u, image: await compressImage(u.image, 800) };
+      }));
+    }
 
     const dbPlant = {
       id: plant.id,
       user_id: userId,
       name: plant.name,
       species: plant.species,
-      main_image_url: mainUrl,
-      thumbnail_url: thumbUrl,
+      main_image: mainUrl,
+      thumbnail: thumbUrl,
       registered_at: plant.registeredAt,
       last_photo_date: plant.lastPhotoDate,
       last_watered: plant.lastWatered,
@@ -153,31 +178,15 @@ async function dbInsertPlant(userId, plant, emailFallback, userPlan = 'free') {
       sunlight: plant.sunlight,
       difficulty: plant.difficulty,
       activities: plant.activities || [],
+      updates: processedUpdates,
       chat_history: plant.chatHistory || [],
       notes: plant.notes || '',
     };
     const { error } = await supabase.from('plants').insert(dbPlant);
     if (error) throw error;
-
-    // Insert the initial photo update into plant_updates
-    if (plant.updates?.[0]) {
-      const firstUpdate = plant.updates[0];
-      const updateImageUrl = firstUpdate.image?.startsWith('data:')
-        ? await uploadImageToBucket(firstUpdate.image, `${userId}/${plant.id}/update_${firstUpdate.id}.jpg`)
-        : firstUpdate.image;
-      const updateThumbUrl = firstUpdate.thumbnail?.startsWith('data:')
-        ? await uploadImageToBucket(firstUpdate.thumbnail, `${userId}/${plant.id}/thumb_${firstUpdate.id}.jpg`)
-        : firstUpdate.thumbnail;
-      await supabase.from('plant_updates').insert({
-        plant_id: plant.id,
-        image_url: updateImageUrl,
-        thumbnail_url: updateThumbUrl,
-        analysis: firstUpdate.analysis,
-        update_type: firstUpdate.type || 'initial',
-      });
-    }
   } catch (err) {
     console.error('Error inserting plant into Supabase:', err?.message || err);
+    alert('Error al guardar la planta en Supabase: ' + (err?.message || JSON.stringify(err)));
   }
 }
 
@@ -193,16 +202,39 @@ async function dbUpdatePlant(userId, plant, emailFallback, userPlan = 'free') {
     }
   } catch {}
 
-  if (!userId || userPlan !== 'premium') return;
+  if (!userId) return;
 
   try {
+    let mainUrl = plant.mainImage;
+    let thumbUrl = plant.thumbnail;
+    let processedUpdates = plant.updates || [];
+    
+    if (userPlan === 'premium') {
+      mainUrl = plant.mainImage?.startsWith('data:') ? await uploadImageToBucket(plant.mainImage, `${userId}/${plant.id}/main.jpg`) : plant.mainImage;
+      thumbUrl = plant.thumbnail?.startsWith('data:') ? await uploadImageToBucket(plant.thumbnail, `${userId}/${plant.id}/thumb.jpg`) : plant.thumbnail;
+      
+      processedUpdates = await Promise.all((plant.updates || []).map(async u => {
+        const uImage = u.image?.startsWith('data:') ? await uploadImageToBucket(u.image, `${userId}/${plant.id}/update_${u.id}.jpg`) : u.image;
+        const uThumb = u.thumbnail?.startsWith('data:') ? await uploadImageToBucket(u.thumbnail, `${userId}/${plant.id}/thumb_${u.id}.jpg`) : u.thumbnail;
+        return { ...u, image: uImage, thumbnail: uThumb };
+      }));
+    } else {
+      mainUrl = await compressImage(plant.mainImage, 800);
+      processedUpdates = await Promise.all((plant.updates || []).map(async u => {
+        return { ...u, image: await compressImage(u.image, 800) };
+      }));
+    }
+
     const dbPlant = {
       name: plant.name,
       species: plant.species,
+      main_image: mainUrl,
+      thumbnail: thumbUrl,
       last_watered: plant.lastWatered,
       last_fertilized: plant.lastFertilized,
       water_streak: plant.waterStreak || 0,
       activities: plant.activities || [],
+      updates: processedUpdates,
       chat_history: plant.chatHistory || [],
       notes: plant.notes || '',
       last_photo_date: plant.lastPhotoDate,
@@ -215,35 +247,7 @@ async function dbUpdatePlant(userId, plant, emailFallback, userPlan = 'free') {
     if (error) throw error;
   } catch (err) {
     console.error('Error updating plant in Supabase:', err?.message || err);
-  }
-}
-
-// Insert a new photo update entry into plant_updates (premium only).
-async function dbInsertPlantUpdate(userId, plantId, updateEntry, userPlan = 'free') {
-  if (!userId || userPlan !== 'premium') return;
-  try {
-    const imageUrl = updateEntry.image?.startsWith('data:')
-      ? await uploadImageToBucket(updateEntry.image, `${userId}/${plantId}/update_${updateEntry.id}.jpg`)
-      : updateEntry.image;
-    const thumbUrl = updateEntry.thumbnail?.startsWith('data:')
-      ? await uploadImageToBucket(updateEntry.thumbnail, `${userId}/${plantId}/thumb_${updateEntry.id}.jpg`)
-      : updateEntry.thumbnail;
-
-    // Also update the plant's main_image_url and thumbnail_url to the latest photo
-    await supabase.from('plants')
-      .update({ main_image_url: imageUrl, thumbnail_url: thumbUrl, last_photo_date: updateEntry.date })
-      .eq('id', plantId).eq('user_id', userId);
-
-    const { error } = await supabase.from('plant_updates').insert({
-      plant_id: plantId,
-      image_url: imageUrl,
-      thumbnail_url: thumbUrl,
-      analysis: updateEntry.analysis,
-      update_type: updateEntry.type || 'update',
-    });
-    if (error) throw error;
-  } catch (err) {
-    console.error('Error inserting plant_update:', err?.message || err);
+    alert('Error al actualizar la planta: ' + (err?.message || JSON.stringify(err)));
   }
 }
 
@@ -256,7 +260,7 @@ async function dbDeletePlant(userId, plantId, emailFallback, userPlan = 'free') 
     if (local) localStorage.setItem(key, JSON.stringify(JSON.parse(local).filter(p => p.id !== plantId)));
   } catch {}
 
-  if (!userId || userPlan !== 'premium') return;
+  if (!userId) return;
 
   try {
     const { error } = await supabase.from('plants').delete().eq('id', plantId).eq('user_id', userId);
@@ -274,11 +278,11 @@ async function fetchUserPlan(userId) {
   try {
     const { data, error } = await supabase
       .from('profiles')
-      .select('premium_until')
+      .select('premium_until, is_premium')
       .eq('id', userId)
       .single();
     if (error) throw error;
-    if (data?.premium_until && new Date(data.premium_until) > new Date()) return 'premium';
+    if (data?.is_premium || (data?.premium_until && new Date(data.premium_until) > new Date())) return 'premium';
     return 'free';
   } catch (err) {
     console.warn('Could not fetch user plan, defaulting to free:', err?.message);
@@ -289,10 +293,11 @@ async function fetchUserPlan(userId) {
 // Activate premium for 30 days by updating profiles.premium_until.
 async function activatePremium(userId) {
   if (!userId) throw new Error('No userId provided');
+  const premiumSince = new Date().toISOString();
   const premiumUntil = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
   const { error } = await supabase
     .from('profiles')
-    .update({ premium_until: premiumUntil })
+    .update({ is_premium: true, premium_since: premiumSince, premium_until: premiumUntil })
     .eq('id', userId);
   if (error) throw error;
   return premiumUntil;
@@ -1086,7 +1091,7 @@ function PlantCard({ plant, onClick }) {
 
 // ─── PLANT DETAIL ─────────────────────────────────────────────────────────────
 
-function PlantDetail({ plant: initialPlant, onBack, onUpdate, onDelete, userPlan, userEmail }) {
+function PlantDetail({ plant: initialPlant, onBack, onUpdate, onDelete, userPlan, userEmail, onUpgradeToPremium }) {
   const [plant, setPlant] = useState(initialPlant);
   const [prevId, setPrevId] = useState(initialPlant.id);
   const [activeTab, setActiveTab] = useState('overview');
@@ -1244,17 +1249,65 @@ Responde de forma concisa, práctica y personalizada para esta planta específic
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(bodyPayload),
       });
-      const data = await response.json();
-      const aiMsg = { role: 'assistant', content: data.result || 'No pude obtener respuesta.', date: new Date().toISOString() };
-      update({ chatHistory: [...history, aiMsg] });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.error || 'No se pudo obtener respuesta.');
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let done = false;
+      let streamedText = '';
+      let isFirstChunk = true;
+
+      while (!done) {
+        const { value, done: doneReading } = await reader.read();
+        done = doneReading;
+        if (value) {
+          const chunk = decoder.decode(value, { stream: !done });
+          streamedText += chunk;
+
+          if (isFirstChunk) {
+            isFirstChunk = false;
+            setChatLoading(false); // Ocultar el spinner de "Pensando..." cuando llega el primer fragmento
+            setPlant(prev => {
+              const prevHistory = prev.chatHistory || [];
+              const assistantMsg = { role: 'assistant', content: streamedText, date: new Date().toISOString() };
+              return { ...prev, chatHistory: [...prevHistory, assistantMsg] };
+            });
+          } else {
+            setPlant(prev => {
+              const newHistory = [...(prev.chatHistory || [])];
+              if (newHistory.length > 0) {
+                const lastIdx = newHistory.length - 1;
+                newHistory[lastIdx] = {
+                  ...newHistory[lastIdx],
+                  content: streamedText,
+                };
+              }
+              return { ...prev, chatHistory: newHistory };
+            });
+          }
+        }
+      }
+
+      // Guardar definitivamente la conversación completa
+      const finalHistory = [...history, { role: 'assistant', content: streamedText, date: new Date().toISOString() }];
+      update({ chatHistory: finalHistory });
 
       // FIX #4: Track usage
       if (userPlan === 'free' && userEmail) {
         const newUsed = incrementChatUsage(userEmail);
         setChatUsed(newUsed);
       }
-    } catch { /* silent fail */ }
-    finally { setChatLoading(false); }
+    } catch (err) {
+      console.error('Chat error:', err);
+      const aiMsg = { role: 'assistant', content: `❌ Error: ${err.message || 'No pude obtener respuesta.'}`, date: new Date().toISOString() };
+      update({ chatHistory: [...history, aiMsg] });
+    } finally {
+      setChatLoading(false);
+    }
   };
 
   // FIX #2: Delete plant
@@ -1305,7 +1358,7 @@ Responde de forma concisa, práctica y personalizada para esta planta específic
         </div>
       )}
 
-      {showUpgrade && <UpgradeModal reason="chat" onClose={() => setShowUpgrade(false)} />}
+      {showUpgrade && <UpgradeModal reason="chat" onClose={() => setShowUpgrade(false)} onUpgrade={onUpgradeToPremium} />}
 
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
         <button onClick={onBack} style={{ ...S.btnOutline, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
@@ -1672,13 +1725,13 @@ Responde de forma concisa, práctica y personalizada para esta planta específic
                     maxWidth: '80%', padding: '10px 14px', borderRadius: msg.role === 'user' ? '16px 16px 4px 16px' : '16px 16px 16px 4px',
                     backgroundColor: msg.role === 'user' ? '#16A34A' : '#F9FAFB',
                     border: msg.role === 'assistant' ? '1px solid #E5E7EB' : 'none',
-                    fontSize: 14, color: msg.role === 'user' ? '#FFFFFF' : '#374151', lineHeight: 1.6,
+                    fontSize: 14, color: msg.role === 'user' ? '#FFFFFF' : '#374151', lineHeight: 1.6, whiteSpace: 'pre-wrap',
                   }}>
                     {/* FIX #5: Show image thumbnail in chat if present */}
                     {msg.image && (
                       <img src={msg.image} alt="" style={{ width: '100%', maxHeight: 120, objectFit: 'contain', borderRadius: 8, marginBottom: 8, display: 'block' }} />
                     )}
-                    {msg.content}
+                    {msg.content ? msg.content.replace(/\*/g, '') : ''}
                   </div>
                 </div>
               ))}
@@ -1904,7 +1957,7 @@ export default function Home() {
     const init = async () => {
       const { data: { session } } = await supabase.auth.getSession();
       if (session?.user) {
-        const u = { email: session.user.email, name: session.user.user_metadata?.name || session.user.email, id: session.user.id };
+        const u = { email: session.user.email, name: session.user.user_metadata?.full_name || session.user.user_metadata?.name || session.user.email, id: session.user.id };
         setUser(u);
         const list = await fetchPlantsFromSupabase(u.id, u.email);
         setPlants(list);
@@ -1915,7 +1968,7 @@ export default function Home() {
     init();
     const { data: { subscription } } = supabase.auth.onAuthStateChange(async (_e, session) => {
       if (session?.user) {
-        const u = { email: session.user.email, name: session.user.user_metadata?.name || session.user.email, id: session.user.id };
+        const u = { email: session.user.email, name: session.user.user_metadata?.full_name || session.user.user_metadata?.name || session.user.email, id: session.user.id };
         setUser(u);
         const list = await fetchPlantsFromSupabase(u.id, u.email);
         setPlants(list);
@@ -1929,10 +1982,10 @@ export default function Home() {
 
   const handleRegister = async (email, password, name) => {
     if (!email || !password || !name) { setAuthError('Completa todos los campos'); return; }
-    const { data, error } = await supabase.auth.signUp({ email, password, options: { data: { name } } });
+    const { data, error } = await supabase.auth.signUp({ email, password, options: { data: { full_name: name } } });
     if (error) { setAuthError(error.message); return; }
     if (data?.user) {
-      await supabase.from('profiles').insert({ id: data.user.id, premium_until: null });
+      // El perfil se crea automáticamente mediante el trigger en Supabase
       setUser({ email: data.user.email, name, id: data.user.id });
       setPlants([]);
       setUserPlan('free');
@@ -1945,7 +1998,7 @@ export default function Home() {
     const { data, error } = await supabase.auth.signInWithPassword({ email, password });
     if (error) { setAuthError('Correo o contraseña incorrectos'); return; }
     if (data?.user) {
-      const u = { email: data.user.email, name: data.user.user_metadata?.name || data.user.email, id: data.user.id };
+      const u = { email: data.user.email, name: data.user.user_metadata?.full_name || data.user.user_metadata?.name || data.user.email, id: data.user.id };
       setUser(u);
       setPlants(loadPlants(u.email));
       setUserPlan(loadUserPlan(u.email));
@@ -1965,6 +2018,18 @@ export default function Home() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
+  const handleUpgradeToPremium = async () => {
+    if (!user) { setAuthError('Inicia sesión para ser premium'); setShowLogin(true); return; }
+    await activatePremium(user.id);
+    setUserPlan('premium');
+    try {
+      const planKey = getUserPlanKey(user.email);
+      const premiumUntil = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+      localStorage.setItem(planKey, JSON.stringify({ plan: 'premium', premiumUntil }));
+    } catch {}
+    setShowUpgradeModal(false);
+  };
+
   // FIX #4: Plant limit check before opening Add flow
   const handleAddPlantClick = () => {
     if (userPlan === 'free' && plants.length >= FREE_PLANT_LIMIT) {
@@ -1979,7 +2044,7 @@ export default function Home() {
     const updated = [newPlant, ...plants];
     setPlants(updated);
     if (user) {
-      await dbInsertPlant(user.id, newPlant, user.email);
+      await dbInsertPlant(user.id, newPlant, user.email, userPlan);
     }
     setShowAddPlant(false);
     setView(VIEWS.MY_PLANTS);
@@ -1991,11 +2056,11 @@ export default function Home() {
       return updated;
     });
     if (user) {
-      await dbUpdatePlant(user.id, updatedPlant, user.email);
+      await dbUpdatePlant(user.id, updatedPlant, user.email, userPlan);
     }
     // FIX #6: keep selectedPlant in sync
     setSelectedPlant(updatedPlant);
-  }, [user]);
+  }, [user, userPlan]);
 
   // FIX #2: Delete plant handler
   const deletePlant = useCallback(async (plantId) => {
@@ -2004,7 +2069,7 @@ export default function Home() {
       return updated;
     });
     if (user) {
-      await dbDeletePlant(user.id, plantId, user.email);
+      await dbDeletePlant(user.id, plantId, user.email, userPlan);
     }
     setSelectedPlant(null);
     setView(VIEWS.MY_PLANTS);
@@ -2033,7 +2098,7 @@ export default function Home() {
       {showRegister && <AuthModal mode="register" onClose={() => { setShowRegister(false); setAuthError(''); }} onSubmit={handleRegister} error={authError} />}
       {showLogin && <AuthModal mode="login" onClose={() => { setShowLogin(false); setAuthError(''); }} onSubmit={handleLogin} error={authError} />}
       {/* FIX #4: Upgrade modal at root level */}
-      {showUpgradeModal && <UpgradeModal reason={upgradeReason} onClose={() => setShowUpgradeModal(false)} />}
+      {showUpgradeModal && <UpgradeModal reason={upgradeReason} onClose={() => setShowUpgradeModal(false)} onUpgrade={handleUpgradeToPremium} />}
       {showAddPlant && <AddPlantFlow onClose={() => setShowAddPlant(false)} onSave={savePlant} user={user} />}
 
       {/* ── NAVBAR ── */}
@@ -2130,6 +2195,7 @@ export default function Home() {
               onDelete={deletePlant}
               userPlan={userPlan}
               userEmail={user?.email}
+              onUpgradeToPremium={handleUpgradeToPremium}
             />
           </div>
         ) : null}
