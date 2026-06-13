@@ -1992,51 +1992,71 @@ function HomeInner() {
   const [upgradeReason, setUpgradeReason] = useState('plants');
 
   useEffect(() => {
+    let isMounted = true;
+    let initDone = false;
+
+    // Safety timeout: if init hangs for any reason, show the page anyway
+    const safetyTimeout = setTimeout(() => {
+      if (isMounted && !initDone) {
+        console.warn('[EcoScan] Init timed out after 5s, showing page anyway');
+        initDone = true;
+        setReady(true);
+      }
+    }, 5000);
+
+    const loadUserData = (u) => {
+      // Fire-and-forget: load plants and plan in background, don't block rendering
+      fetchPlantsFromSupabase(u.id, u.email)
+        .then(list => { if (isMounted) setPlants(list || []); })
+        .catch(e => console.error('[EcoScan] Error loading plants:', e));
+      fetchUserPlan(u.id)
+        .then(plan => { if (isMounted) setUserPlan(plan || 'free'); })
+        .catch(e => console.error('[EcoScan] Error loading plan:', e));
+    };
+
     const init = async () => {
       try {
-        const { data } = await supabase.auth.getSession();
+        const { data, error } = await supabase.auth.getSession();
+        if (error) console.error('[EcoScan] getSession error:', error.message);
         const session = data?.session;
-        if (session?.user) {
+        if (session?.user && isMounted) {
           const u = { email: session.user.email, name: session.user.user_metadata?.full_name || session.user.user_metadata?.name || session.user.email, id: session.user.id };
           setUser(u);
-          try {
-            const list = await fetchPlantsFromSupabase(u.id, u.email);
-            setPlants(list || []);
-          } catch (e) { console.error('Error loading plants on init:', e); }
-          try {
-            const plan = await fetchUserPlan(u.id);
-            setUserPlan(plan || 'free');
-          } catch (e) { console.error('Error loading plan on init:', e); }
+          loadUserData(u);
         }
       } catch (err) {
-        console.error('Error during session init:', err);
+        console.error('[EcoScan] Error during session init:', err);
       } finally {
-        setReady(true);
+        if (isMounted && !initDone) {
+          initDone = true;
+          clearTimeout(safetyTimeout);
+          setReady(true);
+        }
       }
     };
     init();
-    const { data: authListener } = supabase.auth.onAuthStateChange(async (_e, session) => {
+
+    const { data: authListener } = supabase.auth.onAuthStateChange(async (event, session) => {
+      // Skip INITIAL_SESSION — already handled by init() above
+      if (event === 'INITIAL_SESSION') return;
       try {
-        if (session?.user) {
+        if (session?.user && isMounted) {
           const u = { email: session.user.email, name: session.user.user_metadata?.full_name || session.user.user_metadata?.name || session.user.email, id: session.user.id };
           setUser(u);
-          try {
-            const list = await fetchPlantsFromSupabase(u.id, u.email);
-            setPlants(list || []);
-          } catch (e) { console.error('Error loading plants on auth change:', e); }
-          try {
-            const plan = await fetchUserPlan(u.id);
-            setUserPlan(plan || 'free');
-          } catch (e) { console.error('Error loading plan on auth change:', e); }
-        } else {
+          loadUserData(u);
+        } else if (isMounted) {
           setUser(null); setPlants([]); setUserPlan('free');
         }
       } catch (err) {
-        console.error('Error in onAuthStateChange:', err);
+        console.error('[EcoScan] Error in onAuthStateChange:', err);
       }
     });
     const subscription = authListener?.subscription;
-    return () => { if (subscription) subscription.unsubscribe(); };
+    return () => {
+      isMounted = false;
+      clearTimeout(safetyTimeout);
+      if (subscription) subscription.unsubscribe();
+    };
   }, []);
 
   const handleRegister = async (email, password, name) => {
